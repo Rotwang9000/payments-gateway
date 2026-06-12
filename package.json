@@ -1,0 +1,56 @@
+{
+	"name": "payments-gateway",
+	"version": "0.3.0",
+	"description": "Generic MCP + REST payments gateway. Charge for any service two ways: direct payment with confirmation (x402 USDC per-call; co-signed outbound ZEC where a human approves each spend) or top-up & use (prepaid credit meters fed by x402 or native XMR/ZEC payments, watched via view keys only). Embed it in your own server or run it standalone for your agents. Built on x402-server-kit + viewkey-watch.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Rotwang9000/payments-gateway.git"
+	},
+	"bin": {
+		"gateway-rest": "bin/rest.mjs",
+		"gateway-mcp": "bin/mcp.mjs",
+		"gateway-private-watch-poller": "bin/private-watch-poller.mjs",
+		"gateway-crypto-recv-poller": "bin/crypto-recv-poller.mjs"
+	},
+	"exports": {
+		".": "./src/index.js",
+		"./*": "./src/*.js"
+	},
+	"scripts": {
+		"start:rest": "node bin/rest.mjs",
+		"start:mcp": "node bin/mcp.mjs",
+		"poll:watches": "node bin/private-watch-poller.mjs",
+		"poll:crypto-recv": "node bin/crypto-recv-poller.mjs",
+		"test": "node --experimental-vm-modules node_modules/.bin/jest",
+		"test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch"
+	},
+	"dependencies": {
+		"@coinbase/x402": "^2.1.0",
+		"@fastify/cors": "^11.2.0",
+		"@fastify/rate-limit": "^10.3.0",
+		"@modelcontextprotocol/sdk": "^1.29.0",
+		"@scure/bip39": "^2.2.0",
+		"@winbit32/wallet-kit": "^0.2.0",
+		"@x402/core": "^2.12.0",
+		"@x402/evm": "^2.12.0",
+		"@x402/extensions": "^2.12.0",
+		"@x402/fastify": "^2.12.0",
+		"@x402/paywall": "^2.12.0",
+		"better-sqlite3": "^12.10.0",
+		"fastify": "^5.8.5",
+		"shamirs-secret-sharing": "^2.0.1",
+		"viewkey-watch": "github:Rotwang9000/viewkey-watch#14b2c9c",
+		"x402-server-kit": "github:Rotwang9000/x402-server-kit#bf5b97a",
+		"zod": "^4.4.3"
+	},
+	"devDependencies": {
+		"@jest/globals": "^30.1.2",
+		"jest": "^30.1.3",
+		"supertest": "^7.1.4"
+	},
+	"engines": {
+		"node": ">=20.0.0"
+	}
+}
