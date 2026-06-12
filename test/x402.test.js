@@ -4,6 +4,7 @@ import { describe, test, expect } from '@jest/globals';
 
 import { buildConfig } from '../src/config.js';
 import { buildX402Config, resolveRoutePrices, GATEWAY_PREMIUM_ROUTES } from '../src/x402.js';
+import { qFact } from '../src/x402-routes.js';
 
 const RECIPIENT = '0x' + '12'.repeat(20);
 
@@ -16,6 +17,41 @@ describe('GATEWAY_PREMIUM_ROUTES', () => {
 		expect(paths).toContain('GET /v1/q/zec/last-block');
 		// 5 private + 7 chain facts
 		expect(GATEWAY_PREMIUM_ROUTES.length).toBe(12);
+	});
+
+	// Bazaar indexers grade listings on discovery schemas + examples;
+	// x402scan flags SCHEMA_OUTPUT_MISSING without them. Every catalogue
+	// route must therefore declare an output example.
+	test('every route declares discovery with an output example', () => {
+		for (const r of GATEWAY_PREMIUM_ROUTES) {
+			expect(r.discovery).toBeDefined();
+			expect(r.discovery.output?.example).toBeDefined();
+			expect(r.discovery.output?.schema?.type).toBe('object');
+		}
+	});
+});
+
+describe('qFact discovery assembly', () => {
+	test('emits output from props alone, example alone, or both', () => {
+		const propsOnly = qFact('/x', 'd', { outputProps: { a: { type: 'integer' } } });
+		expect(propsOnly.discovery.output.schema.properties.a).toEqual({ type: 'integer' });
+		expect(propsOnly.discovery.output.example).toBeUndefined();
+
+		const exampleOnly = qFact('/x', 'd', { outputExample: { a: 1 } });
+		expect(exampleOnly.discovery.output.example).toEqual({ a: 1 });
+
+		const both = qFact('/x', 'd', { outputProps: { a: { type: 'integer' } }, outputExample: { a: 1 } });
+		expect(both.discovery.output.example).toEqual({ a: 1 });
+		expect(both.discovery.output.schema.properties.a).toBeDefined();
+
+		const neither = qFact('/x', 'd');
+		expect(neither.discovery.output).toBeUndefined();
+	});
+
+	test('threads input schema + example through', () => {
+		const r = qFact('/x', 'd', { inputSchema: { type: 'object' }, inputExample: { q: '1' } });
+		expect(r.discovery.inputSchema).toEqual({ type: 'object' });
+		expect(r.discovery.input).toEqual({ q: '1' });
 	});
 });
 
