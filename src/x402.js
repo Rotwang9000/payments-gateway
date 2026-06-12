@@ -55,7 +55,10 @@ export function resolveRoutePrices(routes, { cfg = gatewayConfig, env = process.
 		path: r.path,
 		price: (env[r.priceEnvKey] || cfg[envKeyToCfg(r.priceEnvKey)] || cfg.x402FeedPrice || '$0.05').trim(),
 		description: r.description,
-		mimeType: r.mimeType
+		mimeType: r.mimeType,
+		// Bazaar discovery enrichment (inputSchema/output) rides through
+		// to x402-server-kit, which folds it into the declared extension.
+		...(r.discovery ? { discovery: r.discovery } : {})
 	}));
 }
 
