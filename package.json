@@ -16,7 +16,8 @@
 	},
 	"exports": {
 		".": "./src/index.js",
-		"./*": "./src/*.js"
+		"./*": "./src/*.js",
+		"./bin/*": "./bin/*"
 	},
 	"scripts": {
 		"start:rest": "node bin/rest.mjs",
