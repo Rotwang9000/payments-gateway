@@ -28,8 +28,8 @@ export async function buildGatewayApp(options = {}) {
 	await app.register(cors, {
 		origin: true,
 		methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-		allowedHeaders: ['content-type', 'x-payment', 'x-watch-token'],
-		exposedHeaders: ['payment-required', 'x-payment-response', 'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset'],
+		allowedHeaders: ['content-type', 'authorization', 'x-payment', 'x-watch-token'],
+		exposedHeaders: ['payment-required', 'x-payment-response', 'x-ai-cost-usd', 'x-ai-credits-remaining-usd', 'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset'],
 		maxAge: 86400
 	});
 
@@ -81,7 +81,11 @@ export async function buildGatewayApp(options = {}) {
 			'GET|DELETE /v1/private/watch/:id (owner-only)',
 			'POST /v1/private/watch/:id/test (owner-only synthetic webhook)',
 			'GET /v1/private/info (free service metadata)',
-			'GET /v1/private/health (free counters, no PII)'
+			'GET /v1/private/health (free counters, no PII)',
+			'GET /v1/ai (free hosted-AI metadata)',
+			'POST /v1/ai/credits (x402 paywall — buy a prepaid AI credit bundle)',
+			'POST /v1/ai/chat/completions (OpenAI-compatible proxy — Bearer session token)',
+			'GET /v1/ai/credits|models (Bearer session token)'
 		],
 		paywall: paywallSummary
 	}));
@@ -93,7 +97,8 @@ export async function buildGatewayApp(options = {}) {
 		private_watch_enabled: gateway.privateWatchReady(),
 		chains: gateway.chainRpcConfigured,
 		crypto_topup_chains: gateway.cryptoAcceptedChains(),
-		paywall_enabled: x402Cfg.enabled
+		paywall_enabled: x402Cfg.enabled,
+		hosted_ai_enabled: gateway.aiReady ? gateway.aiReady() : false
 	}));
 
 	app.get('/v1/paywall', async () => paywallSummary ?? { enabled: false, reason: 'X402_RECIPIENT_ADDRESS not set' });

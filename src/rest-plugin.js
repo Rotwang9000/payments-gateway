@@ -24,6 +24,8 @@ import {
 } from './queries-q-chain.js';
 import { registerCustomTopupRoute, CUSTOM_TOPUP_LIMITS } from './private-watch-custom.js';
 import { registerCryptoTopupRoutes } from './private-watch-crypto-topup.js';
+import { registerAiRoutes, resolveAiConfig } from './ai-credits.js';
+import { openAiDb } from './ai-session-store.js';
 
 import {
 	openWatchDb,
@@ -440,6 +442,29 @@ export function registerGatewayRoutes(app, opts = {}) {
 		log: app.log
 	});
 
+	// ── Hosted AI: prepaid credit bundles (x402) + OpenAI-compatible proxy ──
+	// Independent of the private-watch subsystem: AI can be enabled even when
+	// view-key watching is off. Opens its own session DB so the two meters
+	// never share a table.
+	const aiConfig = opts.aiConfig ?? resolveAiConfig(config);
+	let aiDb = opts.aiDb ?? null;
+	if (!aiDb && aiConfig.enabled) {
+		try { aiDb = openAiDb(aiConfig.dbPath); }
+		catch (err) {
+			app.log.error({ err: err?.message ?? String(err), dbPath: aiConfig.dbPath }, 'ai: failed to open session DB; hosted AI disabled');
+			aiDb = null;
+		}
+	}
+	const aiHandle = registerAiRoutes(app, {
+		aiDb,
+		aiConfig,
+		x402Cfg,
+		requirePaywall,
+		facilitatorFactory: opts.aiFacilitatorFactory,
+		fetchImpl: opts.aiFetchImpl,
+		log: app.log
+	});
+
 	app.post('/v1/private/historical', async (req, reply) => {
 		if (requirePaywall(reply)) return;
 		if (!nfptClient) {
@@ -620,7 +645,10 @@ export function registerGatewayRoutes(app, opts = {}) {
 		chainRpcConfigured,
 		cryptoAcceptedChains,
 		cryptoTopupPolicy,
-		buildPrivateWatchStats
+		buildPrivateWatchStats,
+		aiConfig,
+		aiDb,
+		aiReady: aiHandle.aiReady
 	};
 }
 
