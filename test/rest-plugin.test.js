@@ -51,13 +51,16 @@ function buildPluginApp(over = {}) {
 	const config = buildConfig({
 		PRIVATE_WATCH_ENCRYPTION_KEY: MASTER_KEY_HEX,
 		MONERO_RPC_URL: 'http://stub-monero',
-		ZCASH_RPC_URL: 'http://stub-zcash'
+		ZCASH_RPC_URL: 'http://stub-zcash',
+		...(over.env ?? {})
 	});
 	const handle = registerGatewayRoutes(app, {
 		config,
 		x402Cfg: over.x402Cfg ?? X402_ENABLED,
 		watchDb: over.watchDb ?? openWatchDb(':memory:'),
 		watchMasterKey: Buffer.from(MASTER_KEY_HEX, 'hex'),
+		// Keep the notice board off disk in tests (defaults to a real path).
+		boardDbPath: ':memory:',
 		nfptClient: createNfptClient({ baseUrl: 'http://nfpt', apiKey: 'k', fetchImpl: nfptStubFetch }),
 		webhookResolver: {
 			resolve4: async (host) => host === 'example.com' ? ['93.184.216.34'] : (() => { const e = new Error('na'); e.code = 'ENODATA'; throw e; })(),
@@ -107,6 +110,28 @@ describe('privacy-chain facts', () => {
 		const r = await app.inject({ method: 'GET', url: '/v1/q/xmr/height' });
 		expect(r.statusCode).toBe(503);
 		expect(r.json().error.code).toBe('paywall_not_configured');
+		await app.close();
+	});
+});
+
+describe('notice board — boards from config (NOTICE_BOARDS)', () => {
+	test('GET /v1/board uses NOTICE_BOARDS when the host passes no explicit boards', async () => {
+		const { app } = buildPluginApp({
+			env: { NOTICE_BOARDS: '[{"id":"agents","title":"Agents","description":"For AI agents."},{"id":"market","title":"Marketplace"}]' }
+		});
+		await app.ready();
+		const r = await app.inject({ method: 'GET', url: '/v1/board' });
+		expect(r.statusCode).toBe(200);
+		expect(r.json().boards.map((b) => b.id)).toEqual(['agents', 'market']);
+		await app.close();
+	});
+
+	test('GET /v1/board falls back to a single general board when NOTICE_BOARDS unset', async () => {
+		const { app } = buildPluginApp();
+		await app.ready();
+		const r = await app.inject({ method: 'GET', url: '/v1/board' });
+		expect(r.statusCode).toBe(200);
+		expect(r.json().boards.map((b) => b.id)).toEqual(['general']);
 		await app.close();
 	});
 });

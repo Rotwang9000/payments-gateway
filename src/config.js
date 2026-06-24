@@ -47,6 +47,27 @@ function asFlag(env, keys, fallback = false) {
 }
 
 /**
+ * Parse a JSON-array env var into a plain array. Used for NOTICE_BOARDS.
+ *
+ * Deliberately LENIENT: returns `fallback` when the var is unset, empty,
+ * not valid JSON, or not an array. The downstream normaliser
+ * (`normaliseBoards`) does the field-level validation (id shape, dedupe),
+ * so a stray entry can't take down a gateway that also serves payments —
+ * a malformed value simply falls back to the default board. Operators
+ * confirm the result via `GET /v1/board`.
+ */
+function asJsonArray(env, keys, fallback = null) {
+	const raw = readFirst(env, Array.isArray(keys) ? keys : [keys]);
+	if (raw === undefined) return fallback;
+	try {
+		const parsed = JSON.parse(raw);
+		return Array.isArray(parsed) ? parsed : fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+/**
  * Build a frozen gateway config from an environment map. Exported so tests
  * (and embedding hosts) can construct alternate configs without mutating
  * process.env.
@@ -115,8 +136,12 @@ export function buildConfig(env = process.env) {
 		// Reads are free; posting is free but rate-limited; boosting a
 		// notice up the board is a variable-amount x402 payment. Own small
 		// writable SQLite, separate from the watch DB. Boards themselves
-		// are defined by the host (passed into registerGatewayRoutes);
-		// standalone falls back to a single 'general' board.
+		// are defined by the host (passed into registerGatewayRoutes); a
+		// standalone deployment can instead declare them here via the
+		// NOTICE_BOARDS env var — a JSON array of { id, title, description }
+		// (e.g. '[{"id":"agents","title":"Agents","description":"For AI agents."}]').
+		// Unset/malformed → falls back to a single 'general' board.
+		noticeBoards: asJsonArray(env, 'NOTICE_BOARDS', null),
 		noticeBoardDbPath: asString(env, ['NOTICE_BOARD_DB', 'GATEWAY_NOTICE_BOARD_DB'], '/var/lib/payments-gateway/notice-board.db'),
 		noticeBoardFreePostPerIpPerHour: asInt(env, 'NOTICE_BOARD_FREE_POST_PER_IP_PER_HOUR', 6),
 		// Operator removal key for DELETE …/{id} with header x-admin-key.

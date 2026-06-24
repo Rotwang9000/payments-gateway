@@ -622,7 +622,7 @@ export function registerGatewayRoutes(app, opts = {}) {
 	const noticeBoard = registerNoticeBoardRoutes(app, {
 		boardDb,
 		x402Cfg,
-		boards: opts.boards,
+		boards: opts.boards ?? config.noticeBoards,
 		adminKey: opts.noticeBoardAdminKey ?? config.noticeBoardAdminKey,
 		facilitatorFactory: opts.facilitatorFactory,
 		freePostRateMax: opts.noticeBoardFreePostPerIpPerHour ?? config.noticeBoardFreePostPerIpPerHour,
