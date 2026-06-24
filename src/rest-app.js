@@ -9,6 +9,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
+import fastifyWebsocket from '@fastify/websocket';
 
 import gatewayConfig from './config.js';
 import { buildX402Config, registerX402, describePaywall } from './x402.js';
@@ -39,6 +40,15 @@ export async function buildGatewayApp(options = {}) {
 			timeWindow: options.rateLimitWindow ?? config.rateLimitTimeWindowMs,
 			cache: 10000,
 			allowList: options.rateLimitAllowList ?? []
+		});
+	}
+
+	// Live chat is opt-in. Register the WebSocket plugin BEFORE the gateway
+	// routes, because the chat WS route is defined inside registerGatewayRoutes
+	// (@fastify/websocket must be present when the route is declared).
+	if (config.chatEnabled && options.websocket !== false) {
+		await app.register(fastifyWebsocket, {
+			options: { maxPayload: (config.chatMaxMessageLen ?? 400) + 2048 }
 		});
 	}
 
@@ -92,7 +102,10 @@ export async function buildGatewayApp(options = {}) {
 			'GET /v1/ai (free hosted-AI metadata)',
 			'POST /v1/ai/credits (x402 paywall — buy a prepaid AI credit bundle)',
 			'POST /v1/ai/chat/completions (OpenAI-compatible proxy — Bearer session token)',
-			'GET /v1/ai/credits|models (Bearer session token)'
+			'GET /v1/ai/credits|models (Bearer session token)',
+			'GET /v1/chat (free — live chat metadata + ws url)',
+			'GET /v1/chat/:channel/history (free — recent messages)',
+			'WS /v1/chat/ws (real-time AIRC-style channels; opt-in)'
 		],
 		paywall: paywallSummary
 	}));
@@ -105,7 +118,8 @@ export async function buildGatewayApp(options = {}) {
 		chains: gateway.chainRpcConfigured,
 		crypto_topup_chains: gateway.cryptoAcceptedChains(),
 		paywall_enabled: x402Cfg.enabled,
-		hosted_ai_enabled: gateway.aiReady ? gateway.aiReady() : false
+		hosted_ai_enabled: gateway.aiReady ? gateway.aiReady() : false,
+		chat_enabled: gateway.chatReady ? gateway.chatReady() : false
 	}));
 
 	app.get('/v1/paywall', async () => paywallSummary ?? { enabled: false, reason: 'X402_RECIPIENT_ADDRESS not set' });

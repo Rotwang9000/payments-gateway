@@ -30,6 +30,7 @@ import { openUnlockDb } from './paid-unlock-store.js';
 import { registerPaidUnlockRoutes } from './paid-unlock-routes.js';
 import { registerAiRoutes, resolveAiConfig } from './ai-credits.js';
 import { openAiDb } from './ai-session-store.js';
+import { registerChatRoutes, resolveChatConfig } from './chat-routes.js';
 import { createX402RelayService } from './x402-relay.js';
 import { registerX402RelayRoutes } from './x402-relay-routes.js';
 
@@ -721,6 +722,17 @@ export function registerGatewayRoutes(app, opts = {}) {
 		log: app.log
 	});
 
+	// ── Live chat: AIRC-style real-time WebSocket channels (opt-in) ──
+	// Ephemeral + in-memory; channels mirror the notice boards by default.
+	// The WS endpoint mounts only when @fastify/websocket is registered on
+	// the app (the standalone product does this in rest-app.js); the REST
+	// /v1/chat metadata + history are always served.
+	const chatHandle = registerChatRoutes(app, {
+		chatConfig: opts.chatConfig ?? resolveChatConfig(config),
+		log: app.log,
+		now: opts.now
+	});
+
 	// Build the private-watch stats block a host folds into its own
 	// stats overview. Mirrors the shape the standalone /v1/stats embeds.
 	function buildPrivateWatchStats() {
@@ -769,6 +781,8 @@ export function registerGatewayRoutes(app, opts = {}) {
 		buildUnlockStats: unlock?.buildUnlockStats ?? null,
 		aiDb,
 		aiReady: aiHandle.aiReady,
+		chatReady: chatHandle.chatReady,
+		chatChannels: chatHandle.channels,
 		x402Relay
 	};
 }

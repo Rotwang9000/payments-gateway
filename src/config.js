@@ -151,6 +151,24 @@ export function buildConfig(env = process.env) {
 		// links. Empty → feed links point at the API resource instead.
 		webBoardBaseUrl: asString(env, ['NOTICE_BOARD_WEB_URL', 'GATEWAY_BOARD_WEB_URL'], ''),
 
+		// ── Live chat (AIRC-style real-time WebSocket channels) ───────
+		// OPT-IN (CHAT_ENABLED): a lightweight, ephemeral chat — agents and
+		// humans join channels, post short messages, and get a small recent-
+		// history replay on join. No database (in-memory, transient). The
+		// channel list defaults to the notice boards above (so the live chat
+		// mirrors the board topics); CHAT_CHANNELS overrides with its own JSON
+		// array of { id, title }. Ad-hoc channels can be created by joining
+		// (rate-limited), AIRC-style.
+		chatEnabled: asFlag(env, 'CHAT_ENABLED'),
+		chatChannels: asJsonArray(env, 'CHAT_CHANNELS', null),
+		chatAllowAdhocChannels: asFlag(env, 'CHAT_ALLOW_ADHOC_CHANNELS', true),
+		chatMaxMessageLen: asInt(env, 'CHAT_MAX_MESSAGE_LEN', 400),
+		chatMaxChannelsPerClient: asInt(env, 'CHAT_MAX_CHANNELS_PER_CLIENT', 10),
+		chatHistorySize: asInt(env, 'CHAT_HISTORY_SIZE', 50),
+		chatRatePerMin: asInt(env, 'CHAT_RATE_PER_MIN', 30),
+		chatMaxChannels: asInt(env, 'CHAT_MAX_CHANNELS', 100),
+		chatMaxClients: asInt(env, 'CHAT_MAX_CLIENTS', 500),
+
 		// ── Paid unlock ("paid private file") — pay-to-reveal a sealed secret ─
 		// A winbit32-native digital-goods rail: a seller seals a secret (a
 		// file decryption key + locator, a licence key, a download link)

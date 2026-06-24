@@ -1,6 +1,6 @@
 {
 	"name": "payments-gateway",
-	"version": "0.5.2",
+	"version": "0.6.0",
 	"description": "Generic MCP + REST payments gateway. Charge for any service two ways: direct payment with confirmation (x402 USDC per-call; co-signed outbound ZEC where a human approves each spend) or top-up & use (prepaid credit meters fed by x402 or native XMR/ZEC payments, watched via view keys only). Embed it in your own server or run it standalone for your agents. Built on x402-server-kit + viewkey-watch.",
 	"type": "module",
 	"license": "MIT",
@@ -31,6 +31,7 @@
 		"@coinbase/x402": "^2.1.0",
 		"@fastify/cors": "^11.2.0",
 		"@fastify/rate-limit": "^10.3.0",
+		"@fastify/websocket": "^11.0.0",
 		"@modelcontextprotocol/sdk": "^1.29.0",
 		"@scure/bip39": "^2.2.0",
 		"@winbit32/wallet-kit": "^0.2.0",
@@ -43,6 +44,7 @@
 		"fastify": "^5.8.5",
 		"shamirs-secret-sharing": "^2.0.1",
 		"viewkey-watch": "github:Rotwang9000/viewkey-watch#14b2c9c",
+		"ws": "^8.18.0",
 		"x402-server-kit": "github:Rotwang9000/x402-server-kit#34779dd",
 		"zod": "^4.4.3"
 	},
