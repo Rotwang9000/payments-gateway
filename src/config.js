@@ -141,6 +141,37 @@ export function buildConfig(env = process.env) {
 		paidUnlockFreeCreatePerIpPerHour: asInt(env, 'PAID_UNLOCK_FREE_CREATE_PER_IP_PER_HOUR', 12),
 		paidUnlockOrderTtlSec: asInt(env, 'PAID_UNLOCK_ORDER_TTL_SEC', 1_800),
 
+		// ── Hosted AI (prepaid credit bundles + OpenAI-compatible proxy) ──
+		// Enabled when AI_UPSTREAM_API_KEY is set (or AI_ENABLED=1). The
+		// upstream key never reaches the browser — callers authenticate with a
+		// short-lived session token bought via x402 at POST /v1/ai/credits.
+		aiEnabled: asFlag(env, 'AI_ENABLED'),
+		aiUpstreamBaseUrl: asString(env, 'AI_UPSTREAM_BASE_URL', 'https://openrouter.ai/api/v1'),
+		aiUpstreamApiKey: asString(env, 'AI_UPSTREAM_API_KEY', ''),
+		// Optional OpenRouter attribution headers (ignored by other upstreams).
+		aiUpstreamReferer: asString(env, 'AI_UPSTREAM_REFERER', ''),
+		aiUpstreamTitle: asString(env, 'AI_UPSTREAM_TITLE', ''),
+		aiDefaultModel: asString(env, 'AI_DEFAULT_MODEL', 'openai/gpt-4o-mini'),
+		// Comma-separated allowlist; empty means "any model the upstream serves".
+		aiModelAllowlist: asString(env, 'AI_MODEL_ALLOWLIST', ''),
+		// Public base URL returned in the credits response (client appends
+		// /chat/completions). Empty → derived from the request host.
+		aiPublicBaseUrl: asString(env, 'AI_PUBLIC_BASE_URL', ''),
+		// Session DB. Empty → sibling of the private-watch DB (ai-sessions.db).
+		aiDbPath: asString(env, ['AI_DB', 'AI_SESSIONS_DB'], ''),
+		aiSessionTtlSec: asInt(env, 'AI_SESSION_TTL_SEC', 30 * 86400),
+		aiRequestTimeoutMs: asInt(env, 'AI_REQUEST_TIMEOUT_MS', 120_000),
+		aiMaxTokensCap: asInt(env, 'AI_MAX_TOKENS_CAP', 4096),
+		// Credit-bundle sizing (US cents). Default $5, range $0.50–$20.
+		aiCreditDefaultUsdCents: asInt(env, 'AI_CREDIT_DEFAULT_USD_CENTS', 500),
+		aiCreditMinUsdCents: asInt(env, 'AI_CREDIT_MIN_USD_CENTS', 50),
+		aiCreditMaxUsdCents: asInt(env, 'AI_CREDIT_MAX_USD_CENTS', 2000),
+		// Per-token billing in atomic USDC (6dp). Defaults margin over a cheap
+		// upstream like gpt-4o-mini; the operator tunes to their upstream costs.
+		aiPricePer1kInputAtomic: asInt(env, 'AI_PRICE_PER_1K_INPUT_ATOMIC', 1000),   // $0.001 / 1k input
+		aiPricePer1kOutputAtomic: asInt(env, 'AI_PRICE_PER_1K_OUTPUT_ATOMIC', 3000), // $0.003 / 1k output
+		aiMinCallAtomic: asInt(env, 'AI_MIN_CALL_ATOMIC', 200),                      // $0.0002 per-call floor
+
 		// ── Privacy-chain JSON-RPC (for /v1/q/xmr|zec facts) ──────────
 		moneroRpcUrl: asString(env, 'MONERO_RPC_URL', 'http://127.0.0.1:18081'),
 		zcashRpcUrl: asString(env, 'ZCASH_RPC_URL', 'http://127.0.0.1:8232'),
