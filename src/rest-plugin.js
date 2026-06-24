@@ -24,8 +24,12 @@ import {
 } from './queries-q-chain.js';
 import { registerCustomTopupRoute, CUSTOM_TOPUP_LIMITS } from './private-watch-custom.js';
 import { registerCryptoTopupRoutes } from './private-watch-crypto-topup.js';
-import { registerAiRoutes, resolveAiConfig } from './ai-credits.js';
-import { openAiDb } from './ai-session-store.js';
+import { openBoardDb } from './notice-board-store.js';
+import { registerNoticeBoardRoutes } from './notice-board-routes.js';
+import { openUnlockDb } from './paid-unlock-store.js';
+import { registerPaidUnlockRoutes } from './paid-unlock-routes.js';
+import { createX402RelayService } from './x402-relay.js';
+import { registerX402RelayRoutes } from './x402-relay-routes.js';
 
 import {
 	openWatchDb,
@@ -181,6 +185,9 @@ export function registerGatewayRoutes(app, opts = {}) {
 	const privateWatchRequireHttps = opts.privateWatchRequireHttps
 		?? (config.privateWatchRequireHttps && !config.privateWatchAllowPrivateWebhooks);
 	const webhookFetchImpl = opts.webhookFetchImpl ?? globalThis.fetch;
+	// x402 payer relay (assigned later, once watchDb is resolved). Declared
+	// here so /v1/private/info can advertise it when enabled.
+	let x402Relay = null;
 
 	if (privateWatchEnabled && opts.disablePrivateWatch !== true) {
 		try {
@@ -282,6 +289,21 @@ export function registerGatewayRoutes(app, opts = {}) {
 			note: 'Fund a watch by paying in Monero or Zcash. We detect the payment with the same view-key scanner the product sells: the box holds only a view key for the receiving wallet, never a spend key.'
 		};
 		if (watchDb) info.crypto_topup.quotes = quoteStatsSnapshot(watchDb);
+		if (x402Relay?.enabled()) {
+			const relayInfo = x402Relay.info();
+			info.x402_relay = {
+				enabled: true,
+				network: relayInfo.network,
+				fee: relayInfo.fee,
+				limits: relayInfo.limits,
+				endpoints: {
+					info: 'GET /v1/pay',
+					pay: 'POST /v1/pay { watchId, watchToken, url, method?, body?, maxAmountUsd?, idempotencyKey? }',
+					receipt: 'GET /v1/pay/{id} (header x-watch-token)'
+				},
+				note: 'Spend your prepaid balance at ANY x402 endpoint. We pay from our float and debit your credit for (amount + fee). Fund in USDC (/v1/private/topup*) or in XMR/ZEC (/v1/private/topup-crypto).'
+			};
+		}
 		return info;
 	});
 
@@ -442,29 +464,6 @@ export function registerGatewayRoutes(app, opts = {}) {
 		log: app.log
 	});
 
-	// ── Hosted AI: prepaid credit bundles (x402) + OpenAI-compatible proxy ──
-	// Independent of the private-watch subsystem: AI can be enabled even when
-	// view-key watching is off. Opens its own session DB so the two meters
-	// never share a table.
-	const aiConfig = opts.aiConfig ?? resolveAiConfig(config);
-	let aiDb = opts.aiDb ?? null;
-	if (!aiDb && aiConfig.enabled) {
-		try { aiDb = openAiDb(aiConfig.dbPath); }
-		catch (err) {
-			app.log.error({ err: err?.message ?? String(err), dbPath: aiConfig.dbPath }, 'ai: failed to open session DB; hosted AI disabled');
-			aiDb = null;
-		}
-	}
-	const aiHandle = registerAiRoutes(app, {
-		aiDb,
-		aiConfig,
-		x402Cfg,
-		requirePaywall,
-		facilitatorFactory: opts.aiFacilitatorFactory,
-		fetchImpl: opts.aiFetchImpl,
-		log: app.log
-	});
-
 	app.post('/v1/private/historical', async (req, reply) => {
 		if (requirePaywall(reply)) return;
 		if (!nfptClient) {
@@ -605,6 +604,98 @@ export function registerGatewayRoutes(app, opts = {}) {
 		});
 	});
 
+	// ── Paid notice board (freemium bulletin; pay-to-rank) ────────
+	// Independent of the private-watch subsystem — its own SQLite, free
+	// reads, free (rate-limited) posts, variable-amount x402 boosts. The
+	// host supplies the board list via opts.boards; standalone defaults to
+	// a single 'general' board.
+	let boardDb = opts.boardDb ?? null;
+	if (!boardDb && opts.disableNoticeBoard !== true) {
+		try { boardDb = openBoardDb(opts.boardDbPath ?? config.noticeBoardDbPath); }
+		catch (err) {
+			app.log.error({ err: err?.message ?? String(err), path: config.noticeBoardDbPath }, 'notice-board: failed to open DB; board routes will 503');
+			boardDb = null;
+		}
+	}
+	const noticeBoard = registerNoticeBoardRoutes(app, {
+		boardDb,
+		x402Cfg,
+		boards: opts.boards,
+		adminKey: opts.noticeBoardAdminKey ?? config.noticeBoardAdminKey,
+		facilitatorFactory: opts.facilitatorFactory,
+		freePostRateMax: opts.noticeBoardFreePostPerIpPerHour ?? config.noticeBoardFreePostPerIpPerHour,
+		webBoardBaseUrl: opts.webBoardBaseUrl ?? config.webBoardBaseUrl,
+		log: app.log,
+		now: opts.now
+	});
+
+	// ── Paid unlock ("paid private file") — opt-in pay-to-reveal ──
+	// Off unless the host opts in (PAID_UNLOCK_ENABLED or an injected DB), so
+	// an embedding host doesn't gain a secret-storing write surface by
+	// surprise. Reuses the view-key receiving wallet + price oracle (native
+	// orders), the x402 paywall (USDC buys), and the watch master key for
+	// sealing — the secret is encrypted at rest and only opened on delivery.
+	let unlock = null;
+	let unlockDb = opts.unlockDb ?? null;
+	const paidUnlockOn = opts.paidUnlock === true || config.paidUnlockEnabled === true || Boolean(opts.unlockDb);
+	if (paidUnlockOn && opts.disablePaidUnlock !== true) {
+		if (!unlockDb) {
+			try { unlockDb = openUnlockDb(opts.unlockDbPath ?? config.paidUnlockDbPath); }
+			catch (err) {
+				app.log.error({ err: err?.message ?? String(err), path: config.paidUnlockDbPath }, 'paid-unlock: failed to open DB; routes will 503');
+				unlockDb = null;
+			}
+		}
+		let unlockMasterKey = watchMasterKey ?? opts.watchMasterKey ?? null;
+		if (!unlockMasterKey && config.privateWatchEncryptionKey) {
+			try { unlockMasterKey = parseMasterKey(config.privateWatchEncryptionKey); }
+			catch { unlockMasterKey = null; }
+		}
+		if (unlockDb) {
+			unlock = registerPaidUnlockRoutes(app, {
+				unlockDb,
+				masterKey: unlockMasterKey,
+				x402Cfg,
+				priceOracle: cryptoPriceOracle,
+				recvAddresses: cryptoRecvAddresses,
+				policy: {
+					spreadBps: config.cryptoTopupSpreadBps,
+					confirmations: {
+						zcash: config.cryptoTopupZecConfirmations,
+						monero: config.cryptoTopupXmrConfirmations
+					},
+					orderTtlSec: config.paidUnlockOrderTtlSec
+				},
+				memoPrefix: opts.memoPrefix ?? config.memoPrefix,
+				facilitatorFactory: opts.facilitatorFactory,
+				freeCreateRateMax: opts.paidUnlockFreeCreatePerIpPerHour ?? config.paidUnlockFreeCreatePerIpPerHour,
+				log: app.log,
+				now: opts.now
+			});
+		}
+	}
+
+	// ── x402 payer relay (spend prepaid credit at ANY x402 endpoint) ──
+	// Off unless the host injects a funded payer (opts.x402Payer) AND the
+	// watch DB (the prepaid balance ledger) is open. Brand-neutral: the
+	// signing key lives entirely in the host-built payer.
+	if (opts.x402Payer && watchDb) {
+		x402Relay = createX402RelayService({
+			watchDb,
+			payX402: opts.x402Payer,
+			getWatch: storeGetWatch,
+			config,
+			lookup: opts.relayLookup,
+			now: opts.now,
+			log: app.log
+		});
+		registerX402RelayRoutes(app, {
+			service: x402Relay,
+			rateMax: opts.relayPerIpPerMin ?? config.relayPerIpPerMin,
+			log: app.log
+		});
+	}
+
 	// Build the private-watch stats block a host folds into its own
 	// stats overview. Mirrors the shape the standalone /v1/stats embeds.
 	function buildPrivateWatchStats() {
@@ -646,9 +737,12 @@ export function registerGatewayRoutes(app, opts = {}) {
 		cryptoAcceptedChains,
 		cryptoTopupPolicy,
 		buildPrivateWatchStats,
-		aiConfig,
-		aiDb,
-		aiReady: aiHandle.aiReady
+		boardDb: noticeBoard.boardDb,
+		noticeBoards: noticeBoard.boards,
+		buildNoticeBoardStats: noticeBoard.buildNoticeBoardStats,
+		unlockDb: unlock?.unlockDb ?? null,
+		buildUnlockStats: unlock?.buildUnlockStats ?? null,
+		x402Relay
 	};
 }
 

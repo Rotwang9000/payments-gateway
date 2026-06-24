@@ -26,11 +26,17 @@ import {
 	dispatchChainQuestion
 } from './queries-q-chain.js';
 import { describePaywall } from './x402.js';
+import { openBoardDb, listNotices, replyCountsForBoard, statsSnapshot as boardStatsSnapshot } from './notice-board-store.js';
+import { normaliseBoards, sortNotices, buildNoticeSummary, atomicToUsd, BOARD_CONSTANTS } from './notice-board.js';
+import { openUnlockDb, getListing as getUnlockListing, isListingOpen, listPublicListings as listPublicUnlockListings, statsSnapshot as unlockStatsSnapshot } from './paid-unlock-store.js';
+import { publicListing as publicUnlockListing, UNLOCK_CONSTANTS } from './paid-unlock.js';
 
 import {
 	openWatchDb,
-	createWatch as storeCreateWatch
+	createWatch as storeCreateWatch,
+	getWatch as storeGetWatch
 } from 'viewkey-watch/private-watch-store';
+import { createX402RelayService, validateRelayRequest } from './x402-relay.js';
 import {
 	parseMasterKey,
 	encryptViewKey,
@@ -58,6 +64,38 @@ import {
 
 export function asContent(obj) {
 	return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
+}
+
+// Shared, lazily-opened read handle for the notice board. The MCP HTTP
+// transport may build a fresh McpServer per request, so we memoise the
+// SQLite handle at module scope (one per path) instead of per server
+// instance — otherwise every read tool call would leak a file handle.
+// Injected handles (tests) bypass this entirely.
+let _sharedBoardDb = null;
+let _sharedBoardDbPath = null;
+function openSharedBoardDb(path) {
+	if (_sharedBoardDb && _sharedBoardDbPath === path) return _sharedBoardDb;
+	try {
+		_sharedBoardDb = openBoardDb(path);
+		_sharedBoardDbPath = path;
+		return _sharedBoardDb;
+	} catch {
+		return null;
+	}
+}
+
+// Same memoised-handle trick for the paid-unlock read DB (info/listing).
+let _sharedUnlockDb = null;
+let _sharedUnlockDbPath = null;
+function openSharedUnlockDb(path) {
+	if (_sharedUnlockDb && _sharedUnlockDbPath === path) return _sharedUnlockDb;
+	try {
+		_sharedUnlockDb = openUnlockDb(path);
+		_sharedUnlockDbPath = path;
+		return _sharedUnlockDb;
+	} catch {
+		return null;
+	}
 }
 
 // Resolve / open the watch subsystem from opts, falling back to config. The
@@ -289,7 +327,355 @@ export function registerGatewayMcpTools(server, opts = {}) {
 		}
 	});
 
+	registerNoticeBoardMcpTools(server, { ...opts, config, x402Cfg, toolPrefix: prefix });
+
+	// Paid-unlock tools (info/listing reads + a buy pointer). OPT-IN, matching
+	// the REST plugin: only when the host turned the product on, so embedding
+	// hosts don't gain the tools by surprise.
+	if (opts.paidUnlock === true || config.paidUnlockEnabled === true || opts.unlockDb) {
+		registerPaidUnlockMcpTools(server, { ...opts, config, x402Cfg, toolPrefix: prefix });
+	}
+
+	// x402 payer relay (spend prepaid credit anywhere). Only when the host
+	// injects a FUNDED, enabled payer AND the watch DB (balance ledger) is
+	// open — no point advertising the tool when it can't pay (matches the
+	// make_payment family, which only registers when its service exists).
+	if (opts.x402Payer?.enabled && watchDb) {
+		const relayService = opts.x402RelayService ?? createX402RelayService({
+			watchDb,
+			payX402: opts.x402Payer,
+			getWatch: storeGetWatch,
+			config,
+			now: opts.now
+		});
+		registerX402RelayMcpTools(server, { service: relayService, toolPrefix: prefix });
+	}
+
 	return { x402Cfg, watchDb, privateWatchReady };
+}
+
+/**
+ * Register the paid notice-board tool family on `server`.
+ *
+ * Read tools (list/read) do real work against the board DB when one is
+ * reachable (opened lazily, read path only). Write tools (post/boost)
+ * return the REST endpoint + a ready-to-send body so the single, rate-
+ * limited, sanitising write path stays at the REST surface (and boosts
+ * settle over a real x402 hop, which MCP has no clean way to do).
+ *
+ * opts:
+ *   - boards       host board list (array of {id,title,description})
+ *   - boardDb / boardDbPath  inject or locate the board SQLite (reads)
+ *   - toolPrefix   tool-name prefix (default 'gateway')
+ */
+export function registerNoticeBoardMcpTools(server, opts = {}) {
+	const config = opts.config ?? gatewayConfig;
+	const prefix = opts.toolPrefix ?? 'gateway';
+	const boards = normaliseBoards(opts.boards);
+	const boardIds = [...boards.keys()];
+	const boostMin = atomicToUsd(BOARD_CONSTANTS.BOOST_MIN_ATOMIC);
+	const boostMax = atomicToUsd(BOARD_CONSTANTS.BOOST_MAX_ATOMIC);
+
+	// Read handle: an injected handle (tests) wins; otherwise use the
+	// module-scoped shared opener so per-request MCP servers don't each
+	// open their own. null on failure → tools degrade to a REST pointer.
+	const injectedDb = opts.boardDb;
+	function db() {
+		if (injectedDb !== undefined) return injectedDb;
+		return openSharedBoardDb(opts.boardDbPath ?? config.noticeBoardDbPath);
+	}
+
+	server.registerTool(`${prefix}_board_list`, {
+		title: 'Public notice board — list boards (FREE)',
+		description: `List the public notice boards and how many notices each holds. Boards: ${boardIds.join(', ')}. Anyone (agent or human) can post for free; attach USDC to a notice to rank it higher. Reads are free.`,
+		inputSchema: {}
+	}, async () => {
+		const handle = db();
+		const snap = handle ? boardStatsSnapshot(handle) : { boards: {} };
+		return asContent({
+			boards: [...boards.values()].map((b) => ({
+				id: b.id,
+				title: b.title,
+				description: b.description,
+				live: snap.boards?.[b.id]?.live ?? 0,
+				paid: snap.boards?.[b.id]?.paid ?? 0,
+				read: `GET /v1/board/${b.id}`,
+				post: `POST /v1/board/${b.id}`
+			})),
+			posting: { free: true, boost_endpoint: 'POST /v1/board/{board}/{id}/boost', boost_min_usd: boostMin, boost_max_usd: boostMax }
+		});
+	});
+
+	server.registerTool(`${prefix}_board_read`, {
+		title: 'Public notice board — read a board (FREE)',
+		description: 'Return the ranked notices on a board (boosted first by decayed weight, then most recent). Free to call.',
+		inputSchema: {
+			board: z.enum(boardIds).describe('Which board to read.'),
+			limit: z.number().int().min(1).max(BOARD_CONSTANTS.LIST_MAX_LIMIT).optional().describe(`Max notices (default ${BOARD_CONSTANTS.LIST_DEFAULT_LIMIT}).`)
+		}
+	}, async ({ board, limit }) => {
+		const handle = db();
+		if (!handle) {
+			return asContent({ board, notices: [], note: `Board DB not reachable here; read via GET /v1/board/${board}` });
+		}
+		const nowMs = Date.now();
+		const rows = sortNotices(listNotices(handle, { board, status: 'live' }), { nowMs })
+			.slice(0, limit ?? BOARD_CONSTANTS.LIST_DEFAULT_LIMIT);
+		const replyCounts = replyCountsForBoard(handle, board);
+		return asContent({
+			board,
+			count: rows.length,
+			notices: rows.map((r) => ({ ...buildNoticeSummary(r, { nowMs }), reply_count: replyCounts.get(r.id) ?? 0 }))
+		});
+	});
+
+	server.registerTool(`${prefix}_board_post`, {
+		title: 'Public notice board — post a notice (FREE, via REST)',
+		description: 'Prepare a free notice. Returns the REST endpoint + body to POST (the free tier is rate-limited per IP at the REST surface). The response gives you an ownerToken (keep it to edit/withdraw) and a boostEndpoint. New notices start at the bottom — boost to rank up.',
+		inputSchema: {
+			board: z.enum(boardIds).describe('Which board to post to.'),
+			title: z.string().min(BOARD_CONSTANTS.TITLE_MIN).max(BOARD_CONSTANTS.TITLE_MAX).describe('Short title.'),
+			body: z.string().min(1).max(BOARD_CONSTANTS.BODY_MAX).describe('The notice text.'),
+			handle: z.string().max(BOARD_CONSTANTS.HANDLE_MAX).optional().describe('Display name (default anon).'),
+			url: z.string().max(BOARD_CONSTANTS.URL_MAX).optional().describe('Optional http(s) link.'),
+			contact: z.string().max(BOARD_CONSTANTS.CONTACT_MAX).optional().describe('Optional contact handle or URL.'),
+			tags: z.array(z.string()).max(BOARD_CONSTANTS.TAGS_MAX).optional().describe('Up to 5 tags.')
+		}
+	}, async (params) => asContent({
+		post_endpoint: `/v1/board/${params.board}`,
+		method: 'POST',
+		body: {
+			title: params.title,
+			body: params.body,
+			handle: params.handle ?? undefined,
+			url: params.url ?? undefined,
+			contact: params.contact ?? undefined,
+			tags: params.tags ?? undefined
+		},
+		free_note: 'POST the body to this path — no payment or key needed (rate-limited per IP). Keep the returned ownerToken; boost via the returned boostEndpoint to rank higher.'
+	}));
+
+	server.registerTool(`${prefix}_board_reply`, {
+		title: 'Public notice board — reply in a thread (FREE, via REST)',
+		description: 'Prepare a free reply to an existing notice (starts/continues a thread, one level deep). Returns the REST endpoint + body to POST. Title is optional — it defaults to "Re: <thread title>". Replies are free and never boosted; boost the thread root to rank the conversation.',
+		inputSchema: {
+			board: z.enum(boardIds).describe('The board the notice is on.'),
+			id: z.string().min(1).describe('The notice id to reply to (from board_read).'),
+			body: z.string().min(1).max(BOARD_CONSTANTS.BODY_MAX).describe('The reply text.'),
+			title: z.string().min(BOARD_CONSTANTS.TITLE_MIN).max(BOARD_CONSTANTS.TITLE_MAX).optional().describe('Optional title (default "Re: <thread title>").'),
+			handle: z.string().max(BOARD_CONSTANTS.HANDLE_MAX).optional().describe('Display name (default anon).'),
+			url: z.string().max(BOARD_CONSTANTS.URL_MAX).optional().describe('Optional http(s) link.'),
+			tags: z.array(z.string()).max(BOARD_CONSTANTS.TAGS_MAX).optional().describe('Up to 5 tags.')
+		}
+	}, async (params) => asContent({
+		reply_endpoint: `/v1/board/${params.board}/${params.id}/reply`,
+		method: 'POST',
+		body: {
+			body: params.body,
+			title: params.title ?? undefined,
+			handle: params.handle ?? undefined,
+			url: params.url ?? undefined,
+			tags: params.tags ?? undefined
+		},
+		free_note: 'POST the body to this path — no payment or key needed (rate-limited per IP). The reply attaches to the thread root. Keep the returned ownerToken to edit or withdraw it.'
+	}));
+
+	server.registerTool(`${prefix}_board_boost`, {
+		title: 'Public notice board — boost a notice (paid via x402 at REST)',
+		description: `Rank a notice higher by attaching USDC. Returns the REST endpoint + body for your x402 client to settle (any amount $${boostMin}-$${boostMax}). Anyone can boost any notice. This tool does NOT settle payment itself.`,
+		inputSchema: {
+			board: z.enum(boardIds).describe('The board the notice is on.'),
+			id: z.string().min(1).describe('The notice id (from board_read).'),
+			amountAtomic: z.number().int().positive().describe(`Boost amount in atomic USDC (6 decimals). Min ${BOARD_CONSTANTS.BOOST_MIN_ATOMIC} ($${boostMin}), max ${BOARD_CONSTANTS.BOOST_MAX_ATOMIC} ($${boostMax}).`)
+		}
+	}, async (params) => asContent({
+		boost_endpoint: `/v1/board/${params.board}/${params.id}/boost`,
+		method: 'POST',
+		body: { amountAtomic: params.amountAtomic },
+		x402_note: 'POST the body to this path with an x402 payment header for the same amount. Your client settles on Base mainnet then re-POSTs; weight is added only after settlement verifies. Boosts decay gently over ~7 days, so periodic re-boosting keeps a notice on top.'
+	}));
+
+	return { names: ['board_list', 'board_read', 'board_post', 'board_reply', 'board_boost'].map((n) => `${prefix}_${n}`) };
+}
+
+/**
+ * Register the paid-unlock ("paid private file") tool family on `server`.
+ *
+ * Reads (info/listing) do real work against the unlock DB when reachable.
+ * The buy is a REST pointer — the agent's x402 client settles at the REST
+ * surface (MCP has no clean 402 hop), and we never hand a paid secret over
+ * the free transport.
+ *
+ * opts:
+ *   - unlockDb / unlockDbPath  inject or locate the unlock SQLite (reads)
+ *   - x402Cfg                  paywall config (advertises the USDC buy rail)
+ *   - toolPrefix               tool-name prefix (default 'gateway')
+ */
+export function registerPaidUnlockMcpTools(server, opts = {}) {
+	const config = opts.config ?? gatewayConfig;
+	const x402Cfg = opts.x402Cfg ?? buildX402Config({ cfg: config });
+	const prefix = opts.toolPrefix ?? 'gateway';
+
+	const nativeChains = ['zcash', 'monero'].filter((c) => {
+		const addr = c === 'zcash' ? config.zecRecvAddress : config.xmrRecvAddress;
+		return typeof addr === 'string' && addr.length > 0;
+	});
+
+	const injectedDb = opts.unlockDb;
+	function db() {
+		if (injectedDb !== undefined) return injectedDb;
+		return openSharedUnlockDb(opts.unlockDbPath ?? config.paidUnlockDbPath);
+	}
+
+	const trustModel = 'Payment is non-custodial: the coin goes straight to the seller; we only ever hold a VIEW KEY to detect it. The file plaintext never touches us — encrypt it in-browser, host the ciphertext, and seal only the key + locator. The sealed secret is opened in-process to deliver on payment (we are NOT blind to it at release); platform-blind delivery over the Nym mixnet is the planned phase-2.';
+
+	server.registerTool(`${prefix}_paid_unlock_info`, {
+		title: 'Paid unlock — pay to reveal a sealed secret (FREE to query)',
+		description: 'Returns how the pay-to-unlock ("paid private file") rail works: the supported price band, which payment rails are live (native ZEC/XMR detected via view key, and/or USDC via x402), the endpoints, the trust model, and current counters. Free to call.',
+		inputSchema: {}
+	}, async () => {
+		const handle = db();
+		return asContent({
+			product: 'paid-unlock',
+			what: 'Pay to unlock a sealed secret (a file decryption key + locator, a licence key, a download link). A seller seals it behind a price; a buyer pays and pulls it.',
+			price_band_usd: {
+				min: (UNLOCK_CONSTANTS.PRICE_MIN_USD_CENTS / 100).toFixed(2),
+				max: (UNLOCK_CONSTANTS.PRICE_MAX_USD_CENTS / 100).toFixed(2)
+			},
+			pay: { native_chains: nativeChains, usdc_x402: Boolean(x402Cfg?.enabled) },
+			endpoints: {
+				listing: 'GET /v1/unlock/listing/{id}',
+				order_native: 'POST /v1/unlock/listing/{id}/order { chain }',
+				buy_usdc: x402Cfg?.enabled ? 'POST /v1/unlock/listing/{id}/buy (x402)' : null,
+				status: 'GET /v1/unlock/order/{orderId} (header x-claim-token)',
+				claim: 'POST /v1/unlock/order/{orderId}/claim (header x-claim-token)'
+			},
+			trust_model: trustModel,
+			stats: handle ? unlockStatsSnapshot(handle) : null
+		});
+	});
+
+	server.registerTool(`${prefix}_paid_unlock_listing`, {
+		title: 'Paid unlock — look up a listing (FREE)',
+		description: 'Return the public view of a paid-unlock listing by id: title, description, price, and which payment rails it accepts. Never returns the secret (that needs a paid + claimed order). Free to call.',
+		inputSchema: {
+			id: z.string().min(1).describe('The listing id (e.g. ul_… shared by the seller).')
+		}
+	}, async ({ id }) => {
+		const handle = db();
+		if (!handle) return asContent({ error: { code: 'paid_unlock_unavailable', message: `Unlock DB not reachable here; read via GET /v1/unlock/listing/${id}` } });
+		const row = getUnlockListing(handle, id);
+		if (!row || row.status !== 'live' || !isListingOpen(row)) {
+			return asContent({ error: { code: 'not_found', message: 'listing not found, withdrawn or expired' } });
+		}
+		return asContent(publicUnlockListing(row, { nativeChains, x402Enabled: Boolean(x402Cfg?.enabled) }));
+	});
+
+	server.registerTool(`${prefix}_paid_unlock_browse`, {
+		title: 'Paid unlock — browse the public shop (FREE)',
+		description: 'List the publicly-advertised paid-unlock listings (those a seller opted into discovery with visibility:"public"). Newest first; never returns the secret. Link-only listings are intentionally excluded. Free to call.',
+		inputSchema: {
+			limit: z.number().int().min(1).max(UNLOCK_CONSTANTS.DISCOVERY_LIMIT_MAX).optional().describe(`Max listings to return (default ${UNLOCK_CONSTANTS.DISCOVERY_LIMIT_DEFAULT}).`),
+			offset: z.number().int().min(0).optional().describe('Pagination offset.')
+		}
+	}, async ({ limit, offset }) => {
+		const handle = db();
+		if (!handle) return asContent({ error: { code: 'paid_unlock_unavailable', message: 'Unlock DB not reachable here; read via GET /v1/unlock/listings' } });
+		const rows = listPublicUnlockListings(handle, {
+			limit: limit ?? UNLOCK_CONSTANTS.DISCOVERY_LIMIT_DEFAULT,
+			offset: offset ?? 0
+		});
+		return asContent({
+			listings: rows.map((r) => publicUnlockListing(r, { nativeChains, x402Enabled: Boolean(x402Cfg?.enabled) })),
+			count: rows.length,
+			note: 'Public shop feed — opt-in listings only.'
+		});
+	});
+
+	server.registerTool(`${prefix}_paid_unlock_buy`, {
+		title: 'Paid unlock — buy a listing (paid; settle at REST)',
+		description: 'Prepare to unlock a listing. Returns the REST endpoints + bodies: the instant USDC buy (POST .../buy — your x402 client settles, the secret comes back in the response) and the native ZEC/XMR order (POST .../order — get a pay quote, then claim once it confirms). This tool does NOT settle payment or reveal the secret itself.',
+		inputSchema: {
+			id: z.string().min(1).describe('The listing id to unlock.'),
+			chain: z.enum(['usdc', 'zcash', 'monero']).default('usdc').describe('Payment rail: usdc (instant x402 buy) or a native coin (order + claim).')
+		}
+	}, async ({ id, chain }) => {
+		const rail = chain ?? 'usdc';
+		if (rail === 'usdc') {
+			return asContent({
+				buy_endpoint: `/v1/unlock/listing/${id}/buy`,
+				method: 'POST',
+				body: {},
+				x402_note: 'POST to this path with an x402 payment header for the listing price (see the listing). Your client settles on Base then re-POSTs; the secret is returned in the 200 along with a claimToken for re-fetches.'
+			});
+		}
+		return asContent({
+			order_endpoint: `/v1/unlock/listing/${id}/order`,
+			method: 'POST',
+			body: { chain: rail },
+			free_note: `POST { chain: "${rail}" } to get a pay quote (address, exact amount, ${rail === 'zcash' ? 'memo' : 'amount-tag'}, deadline) plus a claimToken. Pay it, poll GET /v1/unlock/order/{orderId} (x-claim-token) until status=paid, then POST .../claim to reveal the secret. Non-custodial: funds go to the seller; we detect via a view key.`
+		});
+	});
+
+	return { names: ['paid_unlock_info', 'paid_unlock_listing', 'paid_unlock_browse', 'paid_unlock_buy'].map((n) => `${prefix}_${n}`) };
+}
+
+/**
+ * Register the x402 payer-relay tool family on `server`.
+ *
+ * Unlike the other paid tools (which hand back a REST endpoint for the
+ * agent's own x402 client to settle), `pay_x402` DOES the payment: it spends
+ * the caller's prepaid balance, so it can settle directly over MCP with no
+ * 402 hop. The agent never needs a Base wallet or USDC.
+ *
+ * opts:
+ *   - service     a createX402RelayService instance (REQUIRED)
+ *   - toolPrefix  tool-name prefix (default 'gateway')
+ */
+export function registerX402RelayMcpTools(server, opts = {}) {
+	const service = opts.service;
+	if (!service) throw new Error('registerX402RelayMcpTools: opts.service is required');
+	const prefix = opts.toolPrefix ?? 'gateway';
+
+	server.registerTool(`${prefix}_pay_x402_info`, {
+		title: 'x402 relay — spend your prepaid balance anywhere (FREE to query)',
+		description: 'Returns whether this gateway can pay OTHER x402 endpoints from your prepaid balance, plus the settlement network, the relay fee (the greater of a flat floor or a percentage), and the per-call/daily caps. Free to call.',
+		inputSchema: {}
+	}, async () => asContent(service.info()));
+
+	server.registerTool(`${prefix}_pay_x402`, {
+		title: 'Pay any x402 endpoint from your prepaid balance (SETTLES — debits credit)',
+		description: 'Pay a third-party x402 resource from your prepaid balance (the credit meter funded via topup / topup-crypto). Unlike the other paid tools this one DOES settle: we probe the target\'s 402 challenge, pay it from our Base USDC float (only if the price is within your maxAmountUsd and the caps), return the upstream response, and debit your balance for (amount + relay fee). No Base wallet or USDC needed on your side — fund once in USDC or XMR/ZEC and spend everywhere. Pass an idempotencyKey to make retries safe.',
+		inputSchema: {
+			watchId: z.string().min(36).max(36).describe('The account (watchId) whose prepaid balance pays.'),
+			watchToken: z.string().min(1).describe('The matching watchToken (constant-time compared).'),
+			url: z.string().min(1).describe('The x402 endpoint to pay. Must be a public https URL that returns an x402 402 challenge on the relay network.'),
+			method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).optional().describe('HTTP method (default GET).'),
+			body: z.union([z.string(), z.record(z.any())]).optional().describe('Optional request body for POST/PUT/PATCH (an object is sent as JSON).'),
+			maxAmountUsd: z.number().positive().optional().describe('Cap on what we will pay the merchant, in USD. Clamped to the per-call ceiling.'),
+			idempotencyKey: z.string().min(8).max(80).optional().describe('Optional dedupe key: a repeat returns the original receipt without paying again.')
+		}
+	}, async (params) => {
+		if (!service.enabled()) {
+			return asContent({ error: { code: 'relay_not_configured', message: 'x402 relay is not enabled on this server.' } });
+		}
+		let validated;
+		try { validated = validateRelayRequest(params, { maxPerCallAtomic: service.limits.maxPerCallAtomic }); }
+		catch (err) { return asContent({ error: { code: 'invalid_request', message: err?.message ?? String(err) } }); }
+		const result = await service.relay({ ...validated, watchId: params.watchId, watchToken: params.watchToken });
+		if (!result.ok) {
+			return asContent({ error: { code: result.error?.code ?? 'relay_failed', message: result.error?.message ?? 'relay failed' }, receipt: result.receipt ?? null });
+		}
+		return asContent({
+			ok: true,
+			replayed: result.replayed ?? false,
+			receipt: result.receipt,
+			balance_usd: result.balance_usd ?? null,
+			response: result.response ?? null
+		});
+	});
+
+	return { names: ['pay_x402_info', 'pay_x402'].map((n) => `${prefix}_${n}`) };
 }
 
 /**

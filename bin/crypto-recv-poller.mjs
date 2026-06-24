@@ -20,6 +20,8 @@ import { openWatchDb } from 'viewkey-watch/private-watch-store';
 import { ensureCryptoTopupSchema } from 'viewkey-watch/crypto-topup-store';
 import { createNfptClient, scanReceiving } from 'viewkey-watch/private-watch-nfpt';
 import { runCryptoRecvTick, makeWatchCreditApplier } from 'viewkey-watch/crypto-recv-poller';
+import { openUnlockDb } from '../src/paid-unlock-store.js';
+import { runUnlockRecvReconcile } from '../src/paid-unlock-poller.js';
 
 // NU6 activation height — a safe default Zcash birthday so an unconfigured
 // birthday never triggers a multi-hour autoDetect walk.
@@ -43,6 +45,17 @@ function configuredChains() {
 	if (config.xmrRecvAddress && config.xmrRecvViewKey) chains.push('monero');
 	if (config.zecRecvAddress && config.zecRecvUfvk) chains.push('zcash');
 	return chains;
+}
+
+// Memoise the wallet scan for the lifetime of ONE tick so the top-up poller
+// and the paid-unlock reconciler share a single NFPT walk per chain rather
+// than hitting the scanner twice. Caches the in-flight promise by chain.
+function memoiseScan(scan) {
+	const cache = new Map();
+	return (chain) => {
+		if (!cache.has(chain)) cache.set(chain, scan(chain));
+		return cache.get(chain);
+	};
 }
 
 function makeScan(nfptClient) {
@@ -85,19 +98,42 @@ async function main() {
 		warn: (obj, msg) => logJson('warn', { msg, ...flatten(obj) }),
 		error: (obj, msg) => logJson('error', { msg, ...flatten(obj) })
 	};
+	// One scan per chain, shared by the top-up poller and the unlock reconciler.
+	const scan = memoiseScan(makeScan(nfptClient));
+	const confirmations = {
+		monero: config.cryptoTopupXmrConfirmations,
+		zcash: config.cryptoTopupZecConfirmations
+	};
 	try {
 		const summary = await runCryptoRecvTick({
 			db,
 			chains,
-			scan: makeScan(nfptClient),
+			scan,
 			applyCredit: makeWatchCreditApplier(db),
-			confirmations: {
-				monero: config.cryptoTopupXmrConfirmations,
-				zcash: config.cryptoTopupZecConfirmations
-			},
+			confirmations,
 			logger
 		});
 		logJson('info', { event: 'crypto_recv_tick', chains, ...summary });
+
+		// Paid-unlock native orders share the same receiving wallet + scan.
+		// Only run when the product is enabled (else the DB might not exist).
+		if (config.paidUnlockEnabled) {
+			let unlockDb = null;
+			try { unlockDb = openUnlockDb(config.paidUnlockDbPath); }
+			catch (err) {
+				logJson('warn', { event: 'paid_unlock_reconcile_skipped', reason: 'open_db_failed', message: err?.message ?? String(err) });
+			}
+			if (unlockDb) {
+				try {
+					const unlockSummary = await runUnlockRecvReconcile({ unlockDb, chains, scan, confirmations, logger });
+					logJson('info', { event: 'paid_unlock_reconcile', chains, ...unlockSummary });
+				}
+				catch (err) {
+					logJson('error', { event: 'paid_unlock_reconcile_failed', message: err?.message ?? String(err), stack: err?.stack });
+				}
+				finally { try { unlockDb.close(); } catch { /* ignore */ } }
+			}
+		}
 		process.exit(0);
 	}
 	catch (err) {

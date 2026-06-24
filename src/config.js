@@ -96,36 +96,50 @@ export function buildConfig(env = process.env) {
 		x402PrivateTopup5Price: asString(env, 'X402_PRIVATE_TOPUP_5_PRICE', '$5.00'),
 		x402PrivateHistoricalPrice: asString(env, 'X402_PRIVATE_HISTORICAL_PRICE', '$0.50'),
 
-		// ── Hosted AI (prepaid credit bundles + OpenAI-compatible proxy) ──
-		// Enabled when AI_UPSTREAM_API_KEY is set (or AI_ENABLED=1). The
-		// upstream key never reaches the browser — callers authenticate with a
-		// short-lived session token bought via x402 at POST /v1/ai/credits.
-		aiEnabled: asFlag(env, 'AI_ENABLED'),
-		aiUpstreamBaseUrl: asString(env, 'AI_UPSTREAM_BASE_URL', 'https://openrouter.ai/api/v1'),
-		aiUpstreamApiKey: asString(env, 'AI_UPSTREAM_API_KEY', ''),
-		// Optional OpenRouter attribution headers (ignored by other upstreams).
-		aiUpstreamReferer: asString(env, 'AI_UPSTREAM_REFERER', ''),
-		aiUpstreamTitle: asString(env, 'AI_UPSTREAM_TITLE', ''),
-		aiDefaultModel: asString(env, 'AI_DEFAULT_MODEL', 'openai/gpt-4o-mini'),
-		// Comma-separated allowlist; empty means "any model the upstream serves".
-		aiModelAllowlist: asString(env, 'AI_MODEL_ALLOWLIST', ''),
-		// Public base URL returned in the credits response (client appends
-		// /chat/completions). Empty → derived from the request host.
-		aiPublicBaseUrl: asString(env, 'AI_PUBLIC_BASE_URL', ''),
-		// Session DB. Empty → sibling of the private-watch DB (ai-sessions.db).
-		aiDbPath: asString(env, ['AI_DB', 'AI_SESSIONS_DB'], ''),
-		aiSessionTtlSec: asInt(env, 'AI_SESSION_TTL_SEC', 30 * 86400),
-		aiRequestTimeoutMs: asInt(env, 'AI_REQUEST_TIMEOUT_MS', 120_000),
-		aiMaxTokensCap: asInt(env, 'AI_MAX_TOKENS_CAP', 4096),
-		// Credit-bundle sizing (US cents). Default $5, range $0.50–$20.
-		aiCreditDefaultUsdCents: asInt(env, 'AI_CREDIT_DEFAULT_USD_CENTS', 500),
-		aiCreditMinUsdCents: asInt(env, 'AI_CREDIT_MIN_USD_CENTS', 50),
-		aiCreditMaxUsdCents: asInt(env, 'AI_CREDIT_MAX_USD_CENTS', 2000),
-		// Per-token billing in atomic USDC (6dp). Defaults margin over a cheap
-		// upstream like gpt-4o-mini; the operator tunes to their upstream costs.
-		aiPricePer1kInputAtomic: asInt(env, 'AI_PRICE_PER_1K_INPUT_ATOMIC', 1000),   // $0.001 / 1k input
-		aiPricePer1kOutputAtomic: asInt(env, 'AI_PRICE_PER_1K_OUTPUT_ATOMIC', 3000), // $0.003 / 1k output
-		aiMinCallAtomic: asInt(env, 'AI_MIN_CALL_ATOMIC', 200),                      // $0.0002 per-call floor
+		// ── x402 payer relay (spend a prepaid balance at ANY x402 endpoint) ─
+		// Off until the host injects a funded payer (a Base signer + x402
+		// client). Caps are atomic USDC (1_000_000 = $1). The global daily cap
+		// is the float guard — the ceiling on USDC the hot wallet fronts/day.
+		// Fee model: GREATER of a flat floor and a percentage (basis points).
+		relayMaxPerCallAtomic: asInt(env, 'RELAY_MAX_PER_CALL_ATOMIC', 1_000_000),
+		relayMaxPerDayPerWatchAtomic: asInt(env, 'RELAY_MAX_PER_DAY_PER_ACCOUNT_ATOMIC', 10_000_000),
+		relayMaxPerDayGlobalAtomic: asInt(env, 'RELAY_MAX_PER_DAY_GLOBAL_ATOMIC', 25_000_000),
+		relayFeeFlatAtomic: asInt(env, 'RELAY_FEE_FLAT_ATOMIC', 1_000),
+		relayFeeBps: asInt(env, 'RELAY_FEE_BPS', 500),
+		relayNetwork: asString(env, ['RELAY_NETWORK', 'X402_NETWORK'], 'eip155:8453'),
+		relayUsdcAsset: asString(env, 'RELAY_USDC_ASSET', '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'),
+		relayPerIpPerMin: asInt(env, 'RELAY_PER_IP_PER_MIN', 30),
+		relayAllowHttp: asFlag(env, 'RELAY_ALLOW_HTTP', false),
+
+		// ── Paid notice board (freemium bulletin; pay-to-rank) ────────
+		// Reads are free; posting is free but rate-limited; boosting a
+		// notice up the board is a variable-amount x402 payment. Own small
+		// writable SQLite, separate from the watch DB. Boards themselves
+		// are defined by the host (passed into registerGatewayRoutes);
+		// standalone falls back to a single 'general' board.
+		noticeBoardDbPath: asString(env, ['NOTICE_BOARD_DB', 'GATEWAY_NOTICE_BOARD_DB'], '/var/lib/payments-gateway/notice-board.db'),
+		noticeBoardFreePostPerIpPerHour: asInt(env, 'NOTICE_BOARD_FREE_POST_PER_IP_PER_HOUR', 6),
+		// Operator removal key for DELETE …/{id} with header x-admin-key.
+		// Empty disables operator removal (owners can still withdraw).
+		noticeBoardAdminKey: asString(env, 'NOTICE_BOARD_ADMIN_KEY', ''),
+		// Human-facing board site, used only to build feed (RSS/JSON) item
+		// links. Empty → feed links point at the API resource instead.
+		webBoardBaseUrl: asString(env, ['NOTICE_BOARD_WEB_URL', 'GATEWAY_BOARD_WEB_URL'], ''),
+
+		// ── Paid unlock ("paid private file") — pay-to-reveal a sealed secret ─
+		// A winbit32-native digital-goods rail: a seller seals a secret (a
+		// file decryption key + locator, a licence key, a download link)
+		// behind a price; a buyer pays in ZEC/XMR (view-key detected, NON-
+		// custodial) or USDC (x402) and pulls the secret. OPT-IN
+		// (PAID_UNLOCK_ENABLED) because it stores sealed secrets — off by
+		// default so an embedding host isn't surprised by a new write surface.
+		// Reuses PRIVATE_WATCH_ENCRYPTION_KEY (sealing), the ZEC/XMR receiving
+		// wallet + crypto price oracle (native quotes) and the x402 paywall
+		// (USDC buys). Its own small writable SQLite.
+		paidUnlockEnabled: asFlag(env, 'PAID_UNLOCK_ENABLED', false),
+		paidUnlockDbPath: asString(env, ['PAID_UNLOCK_DB', 'GATEWAY_PAID_UNLOCK_DB'], '/var/lib/payments-gateway/paid-unlock.db'),
+		paidUnlockFreeCreatePerIpPerHour: asInt(env, 'PAID_UNLOCK_FREE_CREATE_PER_IP_PER_HOUR', 12),
+		paidUnlockOrderTtlSec: asInt(env, 'PAID_UNLOCK_ORDER_TTL_SEC', 1_800),
 
 		// ── Privacy-chain JSON-RPC (for /v1/q/xmr|zec facts) ──────────
 		moneroRpcUrl: asString(env, 'MONERO_RPC_URL', 'http://127.0.0.1:18081'),

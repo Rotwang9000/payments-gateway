@@ -12,6 +12,7 @@ import {
 	qXmrHeight,
 	qXmrMempool,
 	qXmrFee,
+	qXmrFeeEstimate,
 	qXmrLastBlock,
 	qZecHeight,
 	qZecMempool,
@@ -78,6 +79,20 @@ describe('qXmr* adapters (stubbed)', () => {
 		expect(r.fee_per_byte_piconero).toBe(20000);
 		expect(r.fee_per_kb_piconero).toBe(20000 * 1024);
 	});
+	test('qXmrFeeEstimate expands the per-priority fees array into a typical-tx cost', async () => {
+		const r = await qXmrFeeEstimate('http://x', { fetchImpl: stubFetchOk({ result: { fee: 20000, fees: [20000, 80000, 320000, 4000000], quantization_mask: 10000 } }) }, { nowMs: 1765532000000 });
+		expect(r.chain).toBe('monero');
+		expect(r.typical_tx_size_bytes).toBe(1500);
+		expect(r.priorities).toHaveLength(4);
+		expect(r.priorities[0]).toMatchObject({ level: 'slow', fee_per_byte_piconero: 20000, est_fee_piconero: 30000000 });
+		// 320000 piconero/byte × 1500 bytes = 480_000_000 piconero = 0.00048 XMR
+		expect(r.priorities[2]).toMatchObject({ level: 'fast', est_fee_piconero: 480000000, est_fee_xmr: 0.00048 });
+	});
+	test('qXmrFeeEstimate falls back to single per-byte fee when no fees array', async () => {
+		const r = await qXmrFeeEstimate('http://x', { fetchImpl: stubFetchOk({ result: { fee: 20000, quantization_mask: 10000 } }) });
+		expect(r.priorities).toHaveLength(1);
+		expect(r.priorities[0]).toMatchObject({ level: 'normal', est_fee_piconero: 30000000 });
+	});
 	test('qXmrLastBlock computes age', async () => {
 		const r = await qXmrLastBlock('http://x', { fetchImpl: stubFetchOk({ result: { block_header: { height: 100, hash: 'abc', timestamp: 1700000000, difficulty: 1000, block_size: 4096 } } }) }, { nowMs: 1700000050_000 });
 		expect(r.height).toBe(100);
@@ -127,9 +142,9 @@ describe('dispatchChainQuestion', () => {
 	test('throws on unknown question', async () => {
 		await expect(dispatchChainQuestion({ name: 'xmr/bogus', deps: {}, rpcUrls: { monero: 'http://x' } })).rejects.toThrow(/not registered/);
 	});
-	test('registry advertises 7 chain questions', () => {
+	test('registry advertises 8 chain questions', () => {
 		expect(Object.keys(CHAIN_QUESTION_REGISTRY).sort()).toEqual([
-			'xmr/fee', 'xmr/height', 'xmr/last-block', 'xmr/mempool', 'zec/height', 'zec/last-block', 'zec/mempool'
+			'xmr/fee', 'xmr/fee-estimate', 'xmr/height', 'xmr/last-block', 'xmr/mempool', 'zec/height', 'zec/last-block', 'zec/mempool'
 		]);
 	});
 });

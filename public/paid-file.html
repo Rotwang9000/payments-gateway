@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paid file — encrypt in your browser, sell with ZEC/USDC</title>
+<style>
+	:root {
+		--bg: #0d1117; --panel: #161b22; --line: #30363d; --ink: #e6edf3;
+		--muted: #8b949e; --accent: #6ee7b7; --accent2: #58a6ff; --warn: #f0883e; --bad: #ff7b72;
+		--mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	}
+	* { box-sizing: border-box; }
+	body { margin: 0; background: var(--bg); color: var(--ink);
+		font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+	header { padding: 28px 20px 8px; max-width: 920px; margin: 0 auto; }
+	h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.01em; }
+	.sub { color: var(--muted); margin: 0 0 4px; }
+	main { max-width: 920px; margin: 0 auto; padding: 12px 20px 60px; }
+	.grid { display: grid; gap: 18px; grid-template-columns: 1fr; }
+	@media (min-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } }
+	.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+	.card h2 { margin: 0 0 4px; font-size: 17px; }
+	.card .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+	label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+	input, textarea, select, button { font: inherit; }
+	input, textarea, select {
+		width: 100%; background: #0b0f14; color: var(--ink);
+		border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; }
+	textarea { resize: vertical; min-height: 64px; }
+	.row { display: flex; gap: 10px; } .row > * { flex: 1; }
+	button {
+		margin-top: 14px; cursor: pointer; border: 1px solid var(--line);
+		background: #21262d; color: var(--ink); border-radius: 8px; padding: 10px 14px; font-weight: 600; }
+	button.primary { background: linear-gradient(180deg, #238636, #1a6e2c); border-color: #2ea043; }
+	button:disabled { opacity: 0.5; cursor: not-allowed; }
+	.out { margin-top: 14px; background: #0b0f14; border: 1px solid var(--line);
+		border-radius: 8px; padding: 10px 12px; font-family: var(--mono); font-size: 12.5px;
+		white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }
+	.pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+		border: 1px solid var(--line); color: var(--muted); margin-left: 8px; }
+	.ok { color: var(--accent); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+	a { color: var(--accent2); }
+	code { font-family: var(--mono); background: #0b0f14; padding: 1px 5px; border-radius: 5px; }
+	.trust { font-size: 13px; color: var(--muted); border-left: 3px solid var(--accent); padding: 4px 0 4px 12px; margin: 14px 0; }
+	.steps { font-size: 13px; color: var(--muted); margin: 8px 0 0; padding-left: 18px; }
+	.api { margin-top: 10px; }
+	.api input { font-family: var(--mono); font-size: 12px; }
+	.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin: 4px 0 12px; }
+	.check input { width: auto; }
+	.shopItem { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; cursor: pointer; font-family: var(--mono); font-size: 12.5px; }
+	.shopItem:hover { border-color: var(--accent2); }
+</style>
+</head>
+<body>
+<header>
+	<h1>Paid file <span class="pill">non-custodial</span></h1>
+	<p class="sub">Encrypt a file <strong>in your browser</strong>. Sell it for ZEC/XMR or USDC. The buyer pays, then pulls the key &mdash; decryption happens on their device.</p>
+	<p class="trust">The plaintext never leaves your machine. We only ever store the <em>ciphertext locator + a sealed key</em>, and we detect the buyer's coin payment with a <strong>view key</strong> &mdash; funds go straight to the seller, never through us. Platform-blind delivery over the Nym mixnet is the planned next step.</p>
+	<div class="api">
+		<label for="apiBase">API base (your payments-gateway / winbit32 REST host)</label>
+		<input id="apiBase" value="" placeholder="https://mcp.winbit32.com  (leave blank for same origin)">
+	</div>
+</header>
+
+<main>
+<div class="grid">
+
+	<!-- ── SELLER: encrypt + list ───────────────────────────────── -->
+	<section class="card">
+		<h2>1 &middot; Encrypt &amp; list (seller)</h2>
+		<p class="hint">Pick a file, set a price. We encrypt locally, you host the ciphertext, we seal the key.</p>
+
+		<label for="file">File to sell</label>
+		<input id="file" type="file">
+
+		<label for="title">Title</label>
+		<input id="title" maxlength="120" placeholder="e.g. Audit report (PDF)">
+
+		<label for="desc">Description (optional)</label>
+		<textarea id="desc" maxlength="1000" placeholder="What the buyer gets"></textarea>
+
+		<div class="row">
+			<div>
+				<label for="price">Price (USD)</label>
+				<input id="price" type="number" min="0.50" step="0.50" value="5.00">
+			</div>
+			<div>
+				<label for="chain">Native rail</label>
+				<select id="chain"><option value="zcash">Zcash (ZEC)</option><option value="monero">Monero (XMR)</option></select>
+			</div>
+		</div>
+
+		<label for="cipherUrl">Ciphertext URL (where you'll host the <code>.enc</code>)</label>
+		<input id="cipherUrl" placeholder="https://your-host/file.enc  (optional — share the .enc out of band otherwise)">
+
+		<label class="check"><input id="public" type="checkbox"> List in the public shop (otherwise link-only)</label>
+
+		<button id="btnEncrypt" class="primary">Encrypt locally &amp; create listing</button>
+		<div id="sellOut" class="out" hidden></div>
+	</section>
+
+	<!-- ── BUYER: order + claim + decrypt ───────────────────────── -->
+	<section class="card">
+		<h2>2 &middot; Unlock &amp; decrypt (buyer)</h2>
+		<p class="hint">Enter a listing id, pay the ZEC/XMR quote, claim the key, decrypt on your device.</p>
+
+		<label for="listingId">Listing id</label>
+		<input id="listingId" placeholder="ul_…">
+		<div class="row">
+			<button id="btnLookup">Look up</button>
+			<button id="btnOrder">Create pay order</button>
+			<button id="btnBrowse">Browse shop</button>
+		</div>
+		<div id="shopOut" class="out" hidden></div>
+		<div id="buyOut" class="out" hidden></div>
+
+		<label for="claimToken">Claim token (from the order)</label>
+		<input id="claimToken" placeholder="kept locally from the order step">
+		<div class="row">
+			<button id="btnStatus">Check status</button>
+			<button id="btnClaim" class="primary">Claim secret</button>
+		</div>
+
+		<label for="encFile">Downloaded <code>.enc</code> file (to decrypt after claim)</label>
+		<input id="encFile" type="file">
+		<button id="btnDecrypt">Decrypt &amp; save</button>
+		<div id="decOut" class="out" hidden></div>
+	</section>
+
+</div>
+
+<section class="card" style="margin-top:18px">
+	<h2>How it works</h2>
+	<ol class="steps">
+		<li><strong>Encrypt:</strong> AES-256-GCM with a random key, entirely in your browser (WebCrypto). You host the <code>.enc</code>; the platform never sees the plaintext.</li>
+		<li><strong>List:</strong> the <em>secret</em> (key + IV + locator) is sealed at rest. <code>POST /v1/unlock/listing</code>.</li>
+		<li><strong>Pay:</strong> the buyer gets a one-quote (address, exact amount, Zcash memo / Monero amount-tag). Funds go straight to the seller; we detect via a view key. <code>POST /v1/unlock/listing/{id}/order</code> &mdash; or instant USDC via x402 at <code>/buy</code>.</li>
+		<li><strong>Claim &amp; decrypt:</strong> once confirmed, the buyer pulls the key (<code>POST /v1/unlock/order/{id}/claim</code>) and decrypts locally.</li>
+	</ol>
+</section>
+</main>
+
+<script>
+(() => {
+	"use strict";
+	const $ = (id) => document.getElementById(id);
+	const apiBase = () => ($("apiBase").value || "").replace(/\/+$/, "");
+	const url = (p) => apiBase() + p;
+	const show = (el, obj, cls) => { el.hidden = false; el.className = "out" + (cls ? " " + cls : ""); el.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2); };
+
+	// ── base64url helpers ──
+	const b64u = {
+		enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+		dec: (s) => { s = s.replace(/-/g, "+").replace(/_/g, "/"); const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
+	};
+	const download = (bytes, name, type) => {
+		const blob = new Blob([bytes], { type: type || "application/octet-stream" });
+		const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name;
+		document.body.appendChild(a); a.click(); a.remove();
+	};
+	async function api(method, path, body, headers) {
+		const res = await fetch(url(path), {
+			method,
+			headers: { "content-type": "application/json", ...(headers || {}) },
+			body: body ? JSON.stringify(body) : undefined
+		});
+		const text = await res.text();
+		let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+		return { status: res.status, json };
+	}
+
+	let lastSecretMeta = null; // remembered between encrypt → list
+
+	// ── SELLER ──
+	$("btnEncrypt").onclick = async () => {
+		const f = $("file").files[0];
+		if (!f) return show($("sellOut"), "Pick a file first.", "warn");
+		const title = $("title").value.trim();
+		if (title.length < 3) return show($("sellOut"), "Title needs ≥ 3 characters.", "warn");
+		const priceUsdCents = Math.round(parseFloat($("price").value || "0") * 100);
+		try {
+			show($("sellOut"), "Encrypting locally…");
+			const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+			const iv = crypto.getRandomValues(new Uint8Array(12));
+			const plain = new Uint8Array(await f.arrayBuffer());
+			const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain);
+			const rawKey = await crypto.subtle.exportKey("raw", key);
+
+			download(new Uint8Array(ct), (f.name || "file") + ".enc", "application/octet-stream");
+
+			const secret = JSON.stringify({
+				v: 1, alg: "A256GCM",
+				k: b64u.enc(rawKey), iv: b64u.enc(iv),
+				name: f.name, size: f.size, type: f.type || "application/octet-stream",
+				url: ($("cipherUrl").value || "").trim() || null
+			});
+
+			const { status, json } = await api("POST", "/v1/unlock/listing", {
+				title,
+				description: $("desc").value.trim() || undefined,
+				secret,
+				priceUsdCents,
+				payChains: [$("chain").value],
+				visibility: $("public").checked ? "public" : "unlisted"
+			});
+			if (status !== 201) return show($("sellOut"), json, "bad");
+			lastSecretMeta = { name: f.name, type: f.type };
+			const link = location.origin + location.pathname + "#" + json.id;
+			show($("sellOut"),
+				"✓ Encrypted (.enc downloaded) and listed.\n\n" +
+				"Listing id : " + json.id + "\n" +
+				"Price      : " + json.price.usd + "\n" +
+				"Owner token: " + json.ownerToken + "  (keep this to withdraw)\n" +
+				"Share link : " + link + "\n\n" +
+				"Now host the .enc somewhere and give buyers the listing id.", "ok");
+		} catch (e) {
+			show($("sellOut"), "Encrypt/list failed: " + (e && e.message || e), "bad");
+		}
+	};
+
+	// ── BUYER ──
+	$("btnLookup").onclick = async () => {
+		const id = $("listingId").value.trim();
+		if (!id) return show($("buyOut"), "Enter a listing id.", "warn");
+		const { status, json } = await api("GET", "/v1/unlock/listing/" + encodeURIComponent(id));
+		show($("buyOut"), json, status === 200 ? "" : "bad");
+	};
+
+	$("btnBrowse").onclick = async () => {
+		show($("shopOut"), "Loading public shop…");
+		const { status, json } = await api("GET", "/v1/unlock/listings");
+		if (status !== 200 || !json.listings) return show($("shopOut"), json, "bad");
+		if (json.listings.length === 0) return show($("shopOut"), "No public listings yet. Sellers opt in with “List in the public shop”.", "warn");
+		const el = $("shopOut");
+		el.hidden = false;
+		el.textContent = "";
+		json.listings.forEach((l) => {
+			const line = document.createElement("div");
+			line.className = "shopItem";
+			line.textContent = l.price.usd + "  ·  " + l.title + (l.sold_out ? "  (sold out)" : "");
+			line.title = "Click to load " + l.id;
+			line.onclick = () => { $("listingId").value = l.id; $("btnLookup").click(); };
+			el.appendChild(line);
+		});
+	};
+
+	$("btnOrder").onclick = async () => {
+		const id = $("listingId").value.trim();
+		if (!id) return show($("buyOut"), "Enter a listing id.", "warn");
+		const chain = $("chain").value;
+		const { status, json } = await api("POST", "/v1/unlock/listing/" + encodeURIComponent(id) + "/order", { chain });
+		if (status !== 201) return show($("buyOut"), json, "bad");
+		$("claimToken").value = json.claimToken || "";
+		sessionStorage.setItem("uo:" + json.orderId, json.claimToken || "");
+		show($("buyOut"),
+			"Order " + json.orderId + " — pay then claim:\n\n" +
+			json.instructions + "\n\n" + JSON.stringify(json.amount, null, 2) +
+			"\n\nOrder id saved. After paying, Check status until 'paid', then Claim secret.\nORDER_ID=" + json.orderId, "ok");
+		$("buyOut").dataset.orderId = json.orderId;
+	};
+
+	$("btnStatus").onclick = async () => {
+		const orderId = $("buyOut").dataset.orderId;
+		if (!orderId) return show($("buyOut"), "Create an order first.", "warn");
+		const { status, json } = await api("GET", "/v1/unlock/order/" + encodeURIComponent(orderId), null, { "x-claim-token": $("claimToken").value.trim() });
+		show($("buyOut"), json, status === 200 ? (json.status === "paid" ? "ok" : "") : "bad");
+	};
+
+	$("btnClaim").onclick = async () => {
+		const orderId = $("buyOut").dataset.orderId;
+		if (!orderId) return show($("buyOut"), "Create an order first.", "warn");
+		const { status, json } = await api("POST", "/v1/unlock/order/" + encodeURIComponent(orderId) + "/claim", null, { "x-claim-token": $("claimToken").value.trim() });
+		if (status !== 200) return show($("buyOut"), json, "bad");
+		try { window._claimedSecret = JSON.parse(json.secret); } catch { window._claimedSecret = null; }
+		show($("buyOut"), "✓ Secret claimed. Now pick the .enc file below and Decrypt & save.\n\n" + json.secret, "ok");
+	};
+
+	$("btnDecrypt").onclick = async () => {
+		const meta = window._claimedSecret;
+		if (!meta || !meta.k) return show($("decOut"), "Claim the secret first.", "warn");
+		const f = $("encFile").files[0];
+		if (!f) return show($("decOut"), "Pick the downloaded .enc file.", "warn");
+		try {
+			const key = await crypto.subtle.importKey("raw", b64u.dec(meta.k), { name: "AES-GCM" }, false, ["decrypt"]);
+			const ctBytes = new Uint8Array(await f.arrayBuffer());
+			const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64u.dec(meta.iv) }, key, ctBytes);
+			download(new Uint8Array(plain), meta.name || "decrypted.bin", meta.type);
+			show($("decOut"), "✓ Decrypted on your device — saved " + (meta.name || "file") + ".", "ok");
+		} catch (e) {
+			show($("decOut"), "Decrypt failed (wrong file or key?): " + (e && e.message || e), "bad");
+		}
+	};
+
+	// deep link: #ul_… prefills the buyer's listing id
+	if (location.hash.length > 1) $("listingId").value = decodeURIComponent(location.hash.slice(1));
+})();
+</script>
+</body>
+</html>

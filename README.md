@@ -32,6 +32,18 @@ addresses and it is your gateway.
   view-only receiving wallet — a quote locks the rate, a unique
   amount-tag/memo identifies the payer, and the receive poller credits
   the meter when funds land. No accounts, no cards, no custodial balance.
+- **Spend that meter at ANY x402 endpoint** (`POST /v1/pay`, tool
+  `pay_x402`) — the payer relay. **DORMANT / EXPERIMENTAL — kept off.**
+  A funded account *could* pay a third-party x402 server through the
+  gateway (gateway fronts USDC from a hot float, settles the merchant's
+  402 challenge capped, returns the response, debits amount + fee), with
+  reserve→pay→settle→refund accounting and auditable `relay_payments`
+  receipts. It stays off (no host-injected `opts.x402Payer` ⇒ every call
+  503s) because this custodial *hold-then-transmit-to-third-parties* shape
+  is money-transmission-shaped. The **non-custodial successor** — the
+  user's OWN Vultisig vault swaps (Maya/NEAR-Intents) and signs the x402
+  payment, no custody by us — is planned in **winbit32**. The code here is
+  retained and tested but is not the product direction.
 
 ## Key custody
 
@@ -56,7 +68,9 @@ arrive but can never move them.
 | Family | Tools | Keys needed |
 | --- | --- | --- |
 | accept | view-key watches + HMAC webhooks, x402 paywall, XMR/ZEC top-up quotes | view keys only |
+| unlock *(opt-in)* | `paid_unlock_info/listing/browse/buy` (REST `/v1/unlock/*`) — pay-to-reveal a sealed secret ("paid private file"): non-custodial ZEC/XMR (auto-confirmed) or USDC, with an opt-in public shop feed | view keys + the existing master key (sealing) |
 | make | `make_payment`, `make_payment_status`, `make_payment_info` | one FROST share + human cosign (recommended), or a directly supplied phrase/key |
+| relay *(dormant)* | `pay_x402`, `pay_x402_info` (REST `POST /v1/pay`) — custodial spend-anywhere, kept OFF (money-transmission-shaped); non-custodial successor planned in winbit32 | host-injected funded payer (`opts.x402Payer`); a Base USDC float |
 | wallet | balances, scan jobs, UTXOs, broadcast | view keys only |
 | utility | phrase validate/complete/generate, Shamir split/combine | none (local, offline) |
 | info | single-fact chain queries (height/fee/mempool) | none |
@@ -90,6 +104,8 @@ One source of truth, assembled from already-public packages:
 | **Make** outbound **ZEC** payments via FROST co-signing, with `cosignUrl` deep links | ✅ |
 | Wallet view-key tools (`*_zec_scan_*`, `*_zec_utxos`, `*_zec_broadcast`, `*_xmr_scan_*`) | ✅ |
 | Utility tools: `phrase_validate/complete/generate`, `shamir_split/combine` — local + offline | ✅ |
+| **Paid unlock** ("paid private file"): seal a secret, sell it for ZEC/XMR (view-key, auto-confirmed) or USDC (x402); opt-in public shop feed; browser-encrypt demo — opt-in | ✅ |
+| Platform-blind paid-file delivery over **Nym** (key + ciphertext browser-to-browser) | 🛣️ roadmap |
 | Direct phrase/key signing mode; outbound USDC / XMR | 🛣️ roadmap |
 
 ## Running it standalone
@@ -137,6 +153,49 @@ Install as a dependency:
 npm i github:Rotwang9000/payments-gateway
 ```
 
+## Agent discovery (Gopher over HTTPS)
+
+So agents can *find* your services cheaply — before they spend tokens on
+an HTML page or a JSON index — the gateway ships a tiny, dependency-free
+primitive for serving a [Gopher](https://datatracker.ietf.org/doc/html/rfc1436)
+menu natively over HTTPS. The convention: publish a terse, drill-down
+service index at **`/.well-known/agent.gopher`** with
+`Content-Type: application/gopher; charset=utf-8`. It is a typed, navigable
+cousin of [`llms.txt`](https://llmstxt.org) — a discovery layer, **not** a
+replacement for MCP (which is how you *call* a tool).
+
+The `gophermap` module builds, parses and sanitises menus (RFC 1436) in a
+TLS-native "compact" mode that drops Gopher's redundant host/port fields:
+
+```js
+import {
+	info, menu, textItem, link, buildMenu
+} from 'payments-gateway/gophermap';
+
+// Compact mode is the default (host + port dropped — TLS supplies them).
+const body = buildMenu([
+	info('My services — terse index for machines.'),
+	menu('Catalogue', '/.well-known/agent/catalogue'),
+	textItem('about', '/.well-known/agent/about'),
+	link('MCP server', 'https://mcp.example.com/')
+]);
+
+app.get('/.well-known/agent.gopher', (req, reply) =>
+	reply
+		.header('content-type', 'application/gopher; charset=utf-8')
+		.header('cache-control', 'public, max-age=600')
+		.send(body));
+```
+
+A line is just `<type><label>TAB<selector>` (`1` submenu, `0` text leaf,
+`h` `URL:` link, `i` info), terminated by a line containing only `.`.
+Across a real directory the compact menu measures ~29% smaller than the
+equivalent JSON and ~32% smaller than minimal HTML, and progressive
+disclosure (drilling into one branch) is ~5× cheaper than pulling a whole
+index. Live example + a "publish your own" walkthrough:
+[seneschal.space/gopher](https://seneschal.space/gopher) — served from
+[`seneschal.space/.well-known/agent.gopher`](https://seneschal.space/.well-known/agent.gopher).
+
 ## Configuration
 
 Environment-driven via `src/config.js` (`buildConfig(env)`). Key groups:
@@ -158,10 +217,29 @@ Environment-driven via `src/config.js` (`buildConfig(env)`). Key groups:
   `MAKE_PAYMENT_BIRTHDAY_HEIGHT`, the safety rails
   `MAKE_PAYMENT_MAX_ZEC` / `MAKE_PAYMENT_MAX_PENDING`, and
   `COSIGN_APP_URL` for the human-facing cosigner deep links.
+- **Paid unlock** ("paid private file"): `PAID_UNLOCK_ENABLED`,
+  `PAID_UNLOCK_DB`, `PAID_UNLOCK_FREE_CREATE_PER_IP_PER_HOUR`,
+  `PAID_UNLOCK_ORDER_TTL_SEC`. Reuses `PRIVATE_WATCH_ENCRYPTION_KEY` (sealing),
+  the `ZEC_RECV_*` / `XMR_RECV_*` wallet + `CRYPTO_*` oracle (native quotes) and
+  the x402 paywall (USDC buys).
 
 A capability stays `503 *_not_configured` (or its tools are simply not
 registered) until its keys/addresses are set — the `make_payment` tools
-only exist when `MAKE_PAYMENT_WULT_PATH` is configured.
+only exist when `MAKE_PAYMENT_WULT_PATH` is configured, and the paid-unlock
+surface only mounts when `PAID_UNLOCK_ENABLED=1`.
+
+## Paid unlock ("paid private file")
+
+Opt-in pay-to-reveal: a seller seals a small secret (a file decryption key +
+locator, a licence, a link) behind a price; a buyer pays **non-custodially** in
+ZEC/XMR (detected with a view key — funds go straight to the seller, and the
+receive-poller auto-confirms the order) or instantly in USDC over x402, then
+pulls the secret. The file plaintext never touches the server (encrypt
+in-browser, host only the ciphertext); the secret is sealed at rest with the
+gateway master key. Sellers can opt a listing into a public **shop feed**
+(`GET /v1/unlock/listings`) or keep it link-only (default). Full trust model,
+API surface, the native auto-confirm reconciler and the WebCrypto browser demo:
+[`docs/PAID_UNLOCK.md`](docs/PAID_UNLOCK.md).
 
 ## Deployments
 

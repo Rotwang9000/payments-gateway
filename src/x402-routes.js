@@ -286,6 +286,10 @@ export const GATEWAY_PREMIUM_ROUTES = Object.freeze([
 		outputProps: { as_of_ms: { type: 'integer' }, chain: { type: 'string' }, fee_per_byte_piconero: { type: 'number' }, fee_per_kb_piconero: { type: 'number' } },
 		outputExample: { as_of_ms: 1765532000000, chain: 'monero', fee_per_byte_piconero: 20000, fee_per_kb_piconero: 20480000 }
 	}),
+	qFact('/v1/q/xmr/fee-estimate', 'Single-fact: actionable Monero fee recommendation \u2014 estimated total fee (piconero + XMR) for a typical 1500-byte tx at each priority level (slow/normal/fast/fastest). Translates the raw per-byte rate into "what will my tx cost".', {
+		outputProps: { as_of_ms: { type: 'integer' }, chain: { type: 'string' }, typical_tx_size_bytes: { type: 'integer' }, fee_per_byte_piconero: { type: 'number' }, priorities: { type: 'array', items: { type: 'object', properties: { level: { type: 'string' }, fee_per_byte_piconero: { type: 'number' }, est_fee_piconero: { type: 'number' }, est_fee_xmr: { type: 'number' } } } } },
+		outputExample: { as_of_ms: 1765532000000, chain: 'monero', typical_tx_size_bytes: 1500, fee_per_byte_piconero: 20000, priorities: [{ level: 'normal', fee_per_byte_piconero: 20000, est_fee_piconero: 30000000, est_fee_xmr: 0.00003 }] }
+	}),
 	qFact('/v1/q/xmr/last-block', 'Single-fact: timestamp + age of the most recent Monero block, plus hash, difficulty, and size.', {
 		outputProps: { as_of_ms: { type: 'integer' }, chain: { type: 'string' }, height: { type: 'integer' }, hash: { type: 'string' }, timestamp_ms: { type: 'integer' }, age_s: { type: 'integer' }, difficulty: { type: 'number' }, size_bytes: { type: 'integer' } },
 		outputExample: { as_of_ms: 1765532000000, chain: 'monero', height: 3686932, hash: '<block-hash>', timestamp_ms: 1765531900000, age_s: 100, difficulty: 511000000000, size_bytes: 117000 }

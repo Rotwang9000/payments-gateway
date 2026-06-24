@@ -10,6 +10,8 @@ export { buildConfig, config, default as gatewayConfig } from './config.js';
 export {
 	asContent,
 	registerGatewayMcpTools,
+	registerNoticeBoardMcpTools,
+	registerPaidUnlockMcpTools,
 	registerMakePaymentMcpTools,
 	registerWalletKitMcpTools,
 	registerUtilityMcpTools,
@@ -71,11 +73,88 @@ export {
 } from './private-watch-crypto-topup.js';
 
 export {
+	BOARD_CONSTANTS,
+	sanitiseText,
+	normaliseHandle,
+	validateUrl,
+	normaliseTags,
+	normaliseBoards,
+	validatePostRequest,
+	validateBoostAmount,
+	atomicToUsd,
+	effectiveWeight,
+	sortNotices,
+	buildNoticeSummary,
+	buildBoardRss,
+	buildBoardJsonFeed,
+	escapeXml,
+	verifyOwner
+} from './notice-board.js';
+
+export {
+	openBoardDb,
+	createNotice,
+	getNotice,
+	listNotices,
+	countNotices,
+	boostNotice,
+	editNotice,
+	withdrawNotice,
+	removeNotice,
+	reportNotice,
+	statsSnapshot as noticeBoardStatsSnapshot,
+	topBoostedNotices,
+	pruneOld as pruneNotices
+} from './notice-board-store.js';
+
+export { registerNoticeBoardRoutes } from './notice-board-routes.js';
+
+// ── Paid unlock ("paid private file"): pay-to-reveal a sealed secret ──
+export {
+	UNLOCK_CONSTANTS,
+	genUnlockId,
+	genClaimToken,
+	usdCentsToUsdcAtomic,
+	validateListingRequest,
+	sealSecret,
+	openSecret,
+	buildNativeQuote,
+	publicListing,
+	publicOrder,
+	buildOrderInstructions
+} from './paid-unlock.js';
+
+export {
+	openUnlockDb,
+	createListing,
+	getListing,
+	isListingOpen,
+	withdrawListing,
+	listPublicListings,
+	createOrder,
+	getOrder,
+	getOrderAuthorised,
+	markOrderSeen,
+	markOrderPaid,
+	claimOrder,
+	hasOpenOrderWithAmount,
+	expireStaleOrders,
+	listMatchableOrders,
+	statsSnapshot as paidUnlockStatsSnapshot,
+	pruneOld as pruneUnlock
+} from './paid-unlock-store.js';
+
+export { registerPaidUnlockRoutes } from './paid-unlock-routes.js';
+
+export { runUnlockRecvReconcile, paymentCoversOrder } from './paid-unlock-poller.js';
+
+export {
 	monRpc,
 	zecRpc,
 	qXmrHeight,
 	qXmrMempool,
 	qXmrFee,
+	qXmrFeeEstimate,
 	qXmrLastBlock,
 	qZecHeight,
 	qZecMempool,

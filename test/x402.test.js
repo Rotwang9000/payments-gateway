@@ -14,9 +14,10 @@ describe('GATEWAY_PREMIUM_ROUTES', () => {
 		expect(paths).toContain('POST /v1/private/watch');
 		expect(paths).toContain('POST /v1/private/historical');
 		expect(paths).toContain('GET /v1/q/xmr/height');
+		expect(paths).toContain('GET /v1/q/xmr/fee-estimate');
 		expect(paths).toContain('GET /v1/q/zec/last-block');
-		// 5 private + 7 chain facts
-		expect(GATEWAY_PREMIUM_ROUTES.length).toBe(12);
+		// 5 private + 8 chain facts
+		expect(GATEWAY_PREMIUM_ROUTES.length).toBe(13);
 	});
 
 	// Bazaar indexers grade listings on discovery schemas + examples;

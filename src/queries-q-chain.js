@@ -145,6 +145,43 @@ export async function qXmrFee(rpcUrl, deps = {}) {
 	};
 }
 
+// Representative Monero tx weight (≈1 input / 2 outputs). Real txs vary
+// with input count + ring/bulletproof overhead; agents scale linearly.
+const XMR_TYPICAL_TX_SIZE_BYTES = 1500;
+const XMR_PRIORITY_LABELS = Object.freeze(['slow', 'normal', 'fast', 'fastest']);
+
+/**
+ * Q: what will a Monero transaction actually COST me right now?
+ * `get_fee_estimate` returns a per-byte rate (and, on modern monerod, a
+ * `fees` array for the four priority levels). We translate that into a
+ * concrete recommended fee for a typical tx — the actionable number the
+ * raw /v1/q/xmr/fee endpoint leaves the caller to compute themselves.
+ */
+export async function qXmrFeeEstimate(rpcUrl, deps = {}, { nowMs = Date.now() } = {}) {
+	const r = await monRpc(rpcUrl, 'get_fee_estimate', { grace_blocks: 10 }, deps);
+	const perByte = Number(r.fee ?? 0);
+	const sizeBytes = XMR_TYPICAL_TX_SIZE_BYTES;
+	const toEntry = (feePerByte, i) => ({
+		level: XMR_PRIORITY_LABELS[i] ?? `priority_${i}`,
+		fee_per_byte_piconero: feePerByte,
+		est_fee_piconero: Math.round(feePerByte * sizeBytes),
+		est_fee_xmr: Number((feePerByte * sizeBytes / 1e12).toFixed(12))
+	});
+	const fees = Array.isArray(r.fees) ? r.fees.map(Number).filter((n) => Number.isFinite(n)) : [];
+	const priorities = fees.length
+		? fees.slice(0, 4).map(toEntry)
+		: [toEntry(perByte, 1)];
+	return {
+		as_of_ms: nowMs,
+		chain: 'monero',
+		typical_tx_size_bytes: sizeBytes,
+		fee_per_byte_piconero: perByte,
+		quantization_mask: Number(r.quantization_mask ?? 1),
+		priorities,
+		note: 'est_fee_* = per-byte fee × a typical 1500-byte tx; scale linearly by your actual tx weight. 1 XMR = 1e12 piconero.'
+	};
+}
+
 /**
  * Q: how long ago did the last Monero block arrive?
  * Useful for hashrate-tracking / "is the chain stalled?" agents.
@@ -230,13 +267,14 @@ export async function qZecLastBlock(rpcUrl, deps = {}, { nowMs = Date.now() } = 
 // into the advertised catalogue.
 
 export const CHAIN_QUESTION_REGISTRY = Object.freeze({
-	'xmr/height':     { fn: 'qXmrHeight',     chain: 'monero', inputs: [] },
-	'xmr/mempool':    { fn: 'qXmrMempool',    chain: 'monero', inputs: [] },
-	'xmr/fee':        { fn: 'qXmrFee',        chain: 'monero', inputs: [] },
-	'xmr/last-block': { fn: 'qXmrLastBlock',  chain: 'monero', inputs: [] },
-	'zec/height':     { fn: 'qZecHeight',     chain: 'zcash',  inputs: [] },
-	'zec/mempool':    { fn: 'qZecMempool',    chain: 'zcash',  inputs: [] },
-	'zec/last-block': { fn: 'qZecLastBlock',  chain: 'zcash',  inputs: [] }
+	'xmr/height':       { fn: 'qXmrHeight',      chain: 'monero', inputs: [] },
+	'xmr/mempool':      { fn: 'qXmrMempool',     chain: 'monero', inputs: [] },
+	'xmr/fee':          { fn: 'qXmrFee',         chain: 'monero', inputs: [] },
+	'xmr/fee-estimate': { fn: 'qXmrFeeEstimate', chain: 'monero', inputs: [] },
+	'xmr/last-block':   { fn: 'qXmrLastBlock',   chain: 'monero', inputs: [] },
+	'zec/height':       { fn: 'qZecHeight',      chain: 'zcash',  inputs: [] },
+	'zec/mempool':      { fn: 'qZecMempool',     chain: 'zcash',  inputs: [] },
+	'zec/last-block':   { fn: 'qZecLastBlock',   chain: 'zcash',  inputs: [] }
 });
 
 export async function dispatchChainQuestion({ name, deps = {}, rpcUrls }) {
@@ -249,10 +287,11 @@ export async function dispatchChainQuestion({ name, deps = {}, rpcUrls }) {
 		throw new Error(`chain '${entry.chain}' is not configured on this server (missing MONERO_RPC_URL / ZCASH_RPC_URL)`);
 	}
 	switch (entry.fn) {
-		case 'qXmrHeight':    return qXmrHeight(rpcUrl, deps);
-		case 'qXmrMempool':   return qXmrMempool(rpcUrl, deps);
-		case 'qXmrFee':       return qXmrFee(rpcUrl, deps);
-		case 'qXmrLastBlock': return qXmrLastBlock(rpcUrl, deps);
+		case 'qXmrHeight':      return qXmrHeight(rpcUrl, deps);
+		case 'qXmrMempool':     return qXmrMempool(rpcUrl, deps);
+		case 'qXmrFee':         return qXmrFee(rpcUrl, deps);
+		case 'qXmrFeeEstimate': return qXmrFeeEstimate(rpcUrl, deps);
+		case 'qXmrLastBlock':   return qXmrLastBlock(rpcUrl, deps);
 		case 'qZecHeight':    return qZecHeight(rpcUrl, deps);
 		case 'qZecMempool':   return qZecMempool(rpcUrl, deps);
 		case 'qZecLastBlock': return qZecLastBlock(rpcUrl, deps);
