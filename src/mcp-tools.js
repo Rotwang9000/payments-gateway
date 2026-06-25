@@ -63,6 +63,7 @@ import {
 } from './utility-tools.js';
 import {
 	buildAmountAdvice,
+	planAmountSplit,
 	COMMON_AMOUNTS_ZEC
 } from './zcash-amount-privacy.js';
 import {
@@ -948,7 +949,23 @@ export function registerZcashAmountMcpTools(server, opts = {}) {
 		});
 	});
 
-	return { names: ['zec_amount_advice', 'zec_popular_amounts'].map((n) => `${prefix}_${n}`) };
+	server.registerTool(`${prefix}_zec_split_plan`, {
+		title: 'Zcash amount privacy — split a large shield/deshield into blend-in pieces (FREE)',
+		description: 'Plan how to break ONE large, fingerprinting Zcash shield (t→z) or deshield (z→t) into several ordinary-sized "blend-in" pieces, so the whole transfer hides among everyday transactions instead of standing out as a single unusual amount. Returns a greedy decomposition into popular denominations (real on-chain ones when the operator runs the shield-amount index, else a curated list), grouped as "N × amount", a remainder that the denominations could not cover (which may still fingerprint), and explicit CAUTIONS about the part amounts cannot fix: pieces must go in separate transactions, spread over time, to different fresh addresses (deshield) or from different inputs (shield) — otherwise they re-link via common-input/own-address heuristics. Free; pure; no wallet, key, or payment. Splitting REDUCES linkability; it is not anonymity.',
+		inputSchema: {
+			amountZec: z.number().positive().describe('The total ZEC you intend to shield or deshield, to be split into smaller pieces (e.g. 17.3).'),
+			action: z.enum(['shield', 'deshield']).default('deshield').describe('shield = move transparent ZEC into the pool (t→z); deshield = move shielded ZEC out (z→t).'),
+			maxPieces: z.number().int().min(1).max(32).optional().describe('Maximum number of pieces to split into (default 8). Fewer pieces = larger, rounder amounts; more pieces = finer coverage of the target.')
+		}
+	}, async (params) => {
+		const action = params.action === 'shield' ? 'shield' : 'deshield';
+		const handle = db();
+		const popular = liveFeed(handle, { side: action, nearZat: Math.round(params.amountZec * 1e8), limit: 64 });
+		const plan = planAmountSplit(params.amountZec, { action, popular, maxPieces: params.maxPieces ?? 8 });
+		return asContent(plan);
+	});
+
+	return { names: ['zec_amount_advice', 'zec_popular_amounts', 'zec_split_plan'].map((n) => `${prefix}_${n}`) };
 }
 
 /**

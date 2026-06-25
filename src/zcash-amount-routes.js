@@ -14,6 +14,7 @@
 import gatewayConfig from './config.js';
 import {
 	buildAmountAdvice,
+	planAmountSplit,
 	parseAmountList,
 	COMMON_AMOUNTS_ZEC
 } from './zcash-amount-privacy.js';
@@ -78,6 +79,19 @@ export function registerZcashAmountRoutes(app, opts = {}) {
 			catch { /* degrade silently */ }
 		}
 		return advice;
+	});
+
+	app.get('/v1/zec/split-plan', async (req, reply) => {
+		const q = req.query ?? {};
+		const amountZec = Number(q.amount);
+		if (!Number.isFinite(amountZec) || amountZec <= 0) {
+			reply.code(400);
+			return { error: { code: 'invalid_request', message: 'amount must be a positive number of ZEC' } };
+		}
+		const action = q.action === 'shield' ? 'shield' : 'deshield';
+		const maxPieces = Math.min(32, Math.max(1, Number.parseInt(q.maxPieces ?? q.pieces, 10) || 8));
+		const popular = liveFeed(indexDb, { side: action, nearZat: Math.round(amountZec * 1e8), limit: MAX_LIMIT });
+		return planAmountSplit(amountZec, { action, popular, maxPieces });
 	});
 
 	app.get('/v1/zec/popular-amounts', async (req, reply) => {

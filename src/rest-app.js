@@ -90,6 +90,7 @@ export async function buildGatewayApp(options = {}) {
 			'GET /v1/q/xmr/* (Monero atomic facts, x402 paywall)',
 			'GET /v1/q/zec/* (Zcash atomic facts, x402 paywall)',
 			'GET /v1/zec/amount-advice (free — shield/deshield amount-privacy advisor)',
+			'GET /v1/zec/split-plan (free — split a large shield/deshield into blend-in pieces)',
 			'GET /v1/zec/popular-amounts (free — on-chain popular shield/deshield amounts)',
 			'POST /v1/private/watch (x402 paywall — view-key payment monitor)',
 			'POST /v1/private/topup|topup-1|topup-5|topup-custom (x402 paywall — credit top-ups)',

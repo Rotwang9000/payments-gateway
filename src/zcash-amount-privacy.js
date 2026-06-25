@@ -240,6 +240,131 @@ export const assessNotePrivacy = (summary) => {
 	return { level: 'partial', headline: `${pct}% of your shielded value is in common amounts; the rest would fingerprint on a 1:1 exit.` };
 };
 
+/** Resolve a `popular` feed (or the bundled list) to a zats→usageCount map. */
+const denomUsageMap = (popular) => {
+	const usageByZats = new Map();
+	const source = Array.isArray(popular) && popular.length
+		? popular.map((p) => ({ zats: zecToZats(p?.zec ?? p?.amount ?? p), usageCount: Number(p?.count ?? p?.usageCount ?? p?.uses) || null }))
+		: COMMON_AMOUNTS_ZATS.map((zats) => ({ zats, usageCount: null }));
+	for (const p of source) {
+		if (!Number.isFinite(p.zats) || p.zats <= 0) continue;
+		const prev = usageByZats.get(p.zats);
+		if (prev === undefined || (p.usageCount || 0) > (prev || 0)) usageByZats.set(p.zats, p.usageCount ?? null);
+	}
+	return usageByZats;
+};
+
+/**
+ * Plan splitting a large shield/deshield into several blend-in pieces, so the
+ * whole transfer hides among ordinary-sized transactions instead of standing
+ * out as one fingerprinting amount. Greedy change-making over the blend-in
+ * denominations, capped at `maxPieces`; identical pieces are grouped for
+ * display ("3 × 1 ZEC"). Anything the denominations can't cover is returned as
+ * a `remainder` (which may itself fingerprint) rather than silently dropped.
+ *
+ * This is advice about AMOUNTS ONLY. It cannot fix the address/timing side:
+ * pieces sent from/to your own clustered addresses, or in one correlated burst,
+ * are still linkable — see `cautions`. Splitting reduces linkability; it is not
+ * anonymity.
+ *
+ * @param {number} targetZec
+ * @param {object} [o]
+ * @param {'shield'|'deshield'} [o.action='deshield']
+ * @param {Array|null} [o.popular]    live feed of { zec, count } (else bundled)
+ * @param {number} [o.maxPieces=8]    1..32
+ * @param {number} [o.minPieceZat=MIN_BOUNDARY_ZAT_DEFAULT]  dust threshold
+ */
+export const planAmountSplit = (targetZec, {
+	action = 'deshield',
+	popular = null,
+	maxPieces = 8,
+	minPieceZat = MIN_BOUNDARY_ZAT_DEFAULT,
+} = {}) => {
+	const target = zecToZats(targetZec);
+	const cap = Math.max(1, Math.min(32, Math.floor(maxPieces) || 8));
+	const usageByZats = denomUsageMap(popular);
+	const source = Array.isArray(popular) && popular.length ? 'live_index' : 'bundled_list';
+
+	const meta = {
+		target: { zec: zatsToZec(target), zats: target, label: `${formatZec(target)} ZEC`, isCommon: usageByZats.has(target) },
+		action: action === 'shield' ? 'shield' : 'deshield',
+		source,
+		maxPieces: cap,
+	};
+
+	if (!Number.isFinite(target) || target <= 0) {
+		return { ...meta, pieces: [], pieceCount: 0, coverage: { zats: 0, zec: 0, percent: 0 }, remainder: null, exact: false, effectiveness: { level: 'none', headline: 'Enter an amount to plan a split.' }, cautions: [] };
+	}
+
+	const denoms = [...usageByZats.keys()].filter((z) => z <= target).sort((a, b) => b - a);
+	if (denoms.length === 0) {
+		return {
+			...meta,
+			pieces: [], pieceCount: 0, coverage: { zats: 0, zec: 0, percent: 0 },
+			remainder: { zats: target, zec: zatsToZec(target), label: `${formatZec(target)} ZEC`, isCommon: false, isDust: target < minPieceZat },
+			exact: false,
+			effectiveness: { level: 'low', headline: 'Amount is below the smallest blend-in denomination — too small to split usefully.' },
+			cautions: [],
+		};
+	}
+
+	// Greedy descending change-making, capped at `cap` pieces.
+	const pieceZats = [];
+	let remaining = target;
+	for (const d of denoms) {
+		while (remaining >= d && pieceZats.length < cap) { pieceZats.push(d); remaining -= d; }
+		if (pieceZats.length >= cap) break;
+	}
+
+	const grouped = new Map();
+	for (const z of pieceZats) {
+		const g = grouped.get(z) || { zats: z, zec: zatsToZec(z), label: `${formatZec(z)} ZEC`, count: 0, usageCount: usageByZats.get(z) ?? null, common: true };
+		g.count += 1;
+		grouped.set(z, g);
+	}
+	const pieces = [...grouped.values()].sort((a, b) => b.zats - a.zats);
+	const coverageZats = pieceZats.reduce((s, z) => s + z, 0);
+
+	const remainder = remaining > 0
+		? { zats: remaining, zec: zatsToZec(remaining), label: `${formatZec(remaining)} ZEC`, isCommon: usageByZats.has(remaining), isDust: remaining < minPieceZat }
+		: null;
+	const exact = remainder === null;
+
+	let effectiveness;
+	if (pieceZats.length <= 1 && exact) {
+		effectiveness = { level: 'low', headline: `${formatZec(target)} ZEC is already a single blend-in amount — splitting it is optional.` };
+	} else if (exact) {
+		effectiveness = { level: 'good', headline: `Splits cleanly into ${pieceZats.length} blend-in amounts that each hide in the crowd.` };
+	} else if (remainder.isDust) {
+		effectiveness = { level: 'good', headline: `Splits into ${pieceZats.length} blend-in amounts; a tiny ${remainder.label} remainder is left over.` };
+	} else {
+		effectiveness = { level: 'partial', headline: `${pieceZats.length} blend-in amounts cover ${Math.round((coverageZats / target) * 100)}%; the ${remainder.label} remainder still fingerprints — round it, raise the piece limit, or exit it via a swap.` };
+	}
+
+	const cautions = [
+		'Send each piece in a SEPARATE transaction — several pieces in one transaction (or back-to-back in one block) are trivially re-linked.',
+		'Spread them over time; a burst of "ordinary" amounts within minutes is itself a pattern.',
+	];
+	if (meta.action === 'deshield') {
+		cautions.push('Deshield each piece to a DIFFERENT, fresh transparent address — pieces landing on your own clustered addresses re-link instantly via own-address/common-input heuristics.');
+		cautions.push('Stronger still: exit via swaps to fresh destinations instead of your own t-addresses at all.');
+	} else {
+		cautions.push('Fund each shield from DIFFERENT transparent inputs/UTXOs — pieces co-spent from one address are linked by the common-input heuristic before they ever reach the pool.');
+	}
+	cautions.push('Splitting hides the SIZE, not the source or destination. It reduces linkability; it is not anonymity.');
+
+	return {
+		...meta,
+		pieces,
+		pieceCount: pieceZats.length,
+		coverage: { zats: coverageZats, zec: zatsToZec(coverageZats), percent: target > 0 ? Math.round((coverageZats / target) * 100) : 0 },
+		remainder,
+		exact,
+		effectiveness,
+		cautions,
+	};
+};
+
 /** Parse a free-text list of ZEC amounts (commas/space/newlines) into numbers. */
 export const parseAmountList = (text) => {
 	if (typeof text !== 'string') return [];
@@ -268,6 +393,9 @@ export const buildAmountAdvice = ({ amountZec, action = 'deshield', noteAmountsZ
 	const noteSummary = (noteAmountsZec && noteAmountsZec.length)
 		? summariseNoteAmounts(noteAmountsZec, { popular })
 		: null;
+	// Offer a split plan whenever it could help (uncommon, or large enough to
+	// break into >1 blend-in piece) — the agent gets it without a second call.
+	const split = planAmountSplit(amountZec, { action, popular });
 	return {
 		amount_zec: target.zec,
 		amount_zats: target.zats,
@@ -276,6 +404,7 @@ export const buildAmountAdvice = ({ amountZec, action = 'deshield', noteAmountsZ
 		blend_in_source: Array.isArray(popular) && popular.length ? 'live_index' : 'bundled_list',
 		risk,
 		suggestions,
+		split_plan: (split.pieceCount > 1 || !target.isCommon) ? split : null,
 		note_summary: noteSummary ? { ...noteSummary, assessment: assessNotePrivacy(noteSummary) } : null,
 		caveat: 'Blending by amount REDUCES linkability; it does not guarantee anonymity. The strongest exit is not your own transparent address — deshield via a swap to a fresh destination, or coordinate with others.',
 	};
@@ -375,6 +504,7 @@ export default {
 	assessRoundTripRisk,
 	summariseNoteAmounts,
 	assessNotePrivacy,
+	planAmountSplit,
 	parseAmountList,
 	buildAmountAdvice,
 	isCoinbaseTx,

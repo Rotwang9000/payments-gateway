@@ -74,7 +74,7 @@ arrive but can never move them.
 | wallet | balances, scan jobs, UTXOs, broadcast | view keys only |
 | utility | phrase validate/complete/generate, Shamir split/combine | none (local, offline) |
 | info | single-fact chain queries (height/fee/mempool) | none |
-| zcash amounts | `zec_amount_advice`, `zec_popular_amounts` (REST `GET /v1/zec/amount-advice`, `/v1/zec/popular-amounts`) — "blend in" shield/deshield amount advice + the live popular-amount histogram | none (read); a zebra node + the index poller for live counts |
+| zcash amounts | `zec_amount_advice`, `zec_split_plan`, `zec_popular_amounts` (REST `GET /v1/zec/amount-advice`, `/v1/zec/split-plan`, `/v1/zec/popular-amounts`) — "blend in" shield/deshield amount advice, a large-amount split planner, and the live popular-amount histogram | none (read); a zebra node + the index poller for live counts |
 
 ## Built on
 
@@ -102,7 +102,7 @@ One source of truth, assembled from already-public packages:
 | One-off historical view-key scans (spendable/spent notes) | ✅ |
 | Free view-key derivation from a phrase (rate-limited) | ✅ |
 | Single-fact ("Penny Oracle") privacy-chain queries (height/fee/mempool) | ✅ |
-| Zcash amount-privacy advisor (free): "blend in" shield/deshield amounts + round-trip self-dox warning, with a live on-chain popular-amount index ("N others used this") | ✅ |
+| Zcash amount-privacy advisor (free): "blend in" shield/deshield amounts + round-trip self-dox warning + large-amount split planner, with a live on-chain popular-amount index ("N others used this") | ✅ |
 | **Make** outbound **ZEC** payments via FROST co-signing, with `cosignUrl` deep links | ✅ |
 | Wallet view-key tools (`*_zec_scan_*`, `*_zec_utxos`, `*_zec_broadcast`, `*_xmr_scan_*`) | ✅ |
 | Utility tools: `phrase_validate/complete/generate`, `shamir_split/combine` — local + offline | ✅ |

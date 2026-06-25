@@ -19,6 +19,7 @@ import {
 	assessRoundTripRisk,
 	summariseNoteAmounts,
 	assessNotePrivacy,
+	planAmountSplit,
 	parseAmountList,
 	buildAmountAdvice,
 	classifyBoundaryTx,
@@ -112,6 +113,81 @@ describe('parseAmountList', () => {
 	});
 });
 
+describe('planAmountSplit (assisted split planner)', () => {
+	test('splits a large amount into exact blend-in pieces', () => {
+		const p = planAmountSplit(17.3, { action: 'deshield' });
+		expect(p.exact).toBe(true);
+		expect(p.remainder).toBeNull();
+		expect(p.coverage.percent).toBe(100);
+		// 17.3 = 10 + 5 + 2 + 0.25 + 0.05
+		expect(p.pieceCount).toBe(5);
+		expect(p.pieces.every((g) => g.common)).toBe(true);
+		expect(p.pieces.map((g) => g.zec)).toEqual([10, 5, 2, 0.25, 0.05]);
+		expect(p.effectiveness.level).toBe('good');
+	});
+
+	test('groups identical pieces as N × amount', () => {
+		const p = planAmountSplit(0.002); // only 0.001 fits → 2 × 0.001
+		expect(p.pieceCount).toBe(2);
+		expect(p.pieces).toHaveLength(1);
+		expect(p.pieces[0].count).toBe(2);
+		expect(p.pieces[0].zec).toBe(0.001);
+	});
+
+	test('leftover below the smallest denomination is dust, not a fingerprint', () => {
+		const p = planAmountSplit(3.14159, { maxPieces: 8 });
+		expect(p.exact).toBe(false);
+		expect(p.remainder.isDust).toBe(true);
+		expect(p.effectiveness.level).toBe('good');
+	});
+
+	test('a piece cap leaves a fingerprinting remainder → partial', () => {
+		const p = planAmountSplit(88, { maxPieces: 2 });
+		expect(p.pieceCount).toBe(2);
+		expect(p.exact).toBe(false);
+		expect(p.remainder.isDust).toBe(false);
+		expect(p.remainder.zec).toBe(13); // 88 − (50 + 25)
+		expect(p.effectiveness.level).toBe('partial');
+	});
+
+	test('a single common amount needs no split', () => {
+		const p = planAmountSplit(1);
+		expect(p.pieceCount).toBe(1);
+		expect(p.effectiveness.level).toBe('low');
+	});
+
+	test('an amount below the smallest denomination cannot be split', () => {
+		const p = planAmountSplit(0.0005);
+		expect(p.pieceCount).toBe(0);
+		expect(p.remainder.zats).toBe(50_000);
+		expect(p.effectiveness.level).toBe('low');
+	});
+
+	test('a live popular feed drives the denominations + counts', () => {
+		const popular = [{ zec: 2, count: 10 }, { zec: 0.5, count: 4 }];
+		const p = planAmountSplit(4.5, { popular });
+		expect(p.source).toBe('live_index');
+		expect(p.pieces[0].zec).toBe(2);
+		expect(p.pieces[0].count).toBe(2); // 2 + 2 + 0.5
+		expect(p.pieces[0].usageCount).toBe(10);
+		expect(p.exact).toBe(true);
+	});
+
+	test('cautions are action-specific (address vs input side)', () => {
+		const deshield = planAmountSplit(17.3, { action: 'deshield' });
+		const shield = planAmountSplit(17.3, { action: 'shield' });
+		expect(deshield.cautions.join(' ')).toMatch(/fresh transparent address/i);
+		expect(shield.cautions.join(' ')).toMatch(/different transparent inputs/i);
+		expect(deshield.cautions.join(' ')).toMatch(/it is not anonymity/i);
+	});
+
+	test('zero/invalid amount yields an empty plan', () => {
+		const p = planAmountSplit(0);
+		expect(p.pieceCount).toBe(0);
+		expect(p.effectiveness.level).toBe('none');
+	});
+});
+
 describe('buildAmountAdvice (one-shot payload)', () => {
 	test('bundles suggestions, risk, and source flag', () => {
 		const a = buildAmountAdvice({ amountZec: 1, action: 'deshield', noteAmountsZec: [1] });
@@ -125,6 +201,12 @@ describe('buildAmountAdvice (one-shot payload)', () => {
 	test('reports live source when a popular feed is supplied', () => {
 		const a = buildAmountAdvice({ amountZec: 3, popular: [{ zec: 3, count: 12 }] });
 		expect(a.blend_in_source).toBe('live_index');
+	});
+	test('includes a split plan for an amount worth splitting, omits it for a single common amount', () => {
+		expect(buildAmountAdvice({ amountZec: 1 }).split_plan).toBeNull();
+		const a = buildAmountAdvice({ amountZec: 7.3 });
+		expect(a.split_plan).toBeTruthy();
+		expect(a.split_plan.pieceCount).toBeGreaterThan(1);
 	});
 });
 
