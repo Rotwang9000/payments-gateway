@@ -241,6 +241,19 @@ export function buildConfig(env = process.env) {
 		zecShieldIndexMaxBlocksPerTick: asInt(env, 'ZEC_SHIELD_INDEX_MAX_BLOCKS_PER_TICK', 2_000),
 		zecShieldIndexMinBoundaryZat: asInt(env, 'ZEC_SHIELD_INDEX_MIN_BOUNDARY_ZAT', 100_000),
 
+		// ── Zcash "Bus Station" — non-custodial mixing coordination ───
+		// OPT-IN. A rendezvous for many users to leave the Zcash pool with the
+		// same blend-in amount, route and short window — so N look-alike swaps
+		// become one anonymity set. The gateway holds NO funds and NO keys and
+		// stores NO destinations/txids; it only tracks (route, amount, seat
+		// count, departure window). Each rider broadcasts their OWN swap. The
+		// tools + REST routes only appear when this is enabled (a writable DB is
+		// required — there is no read-only fallback like the shield index).
+		zecBusEnabled: asFlag(env, 'ZEC_BUS_ENABLED', false),
+		zecBusDbPath: asString(env, ['ZEC_BUS_DB', 'GATEWAY_ZEC_BUS_DB'], '/var/lib/payments-gateway/zec-bus.db'),
+		zecBusFillTtlMs: asInt(env, 'ZEC_BUS_FILL_TTL_MS', 24 * 60 * 60_000),
+		zecBusDepartWindowMs: asInt(env, 'ZEC_BUS_DEPART_WINDOW_MS', 20 * 60_000),
+
 		// ── NFPT view-key scanner ─────────────────────────────────────
 		nfptBaseUrl: asString(env, 'NFPT_BASE_URL', 'http://127.0.0.1:3555'),
 		nfptApiKey: asString(env, 'NFPT_API_KEY', 'development-key-for-testing'),

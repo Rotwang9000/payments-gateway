@@ -16,6 +16,7 @@ import { buildX402Config, registerX402, describePaywall } from './x402.js';
 import { CHAIN_QUESTION_REGISTRY } from './queries-q-chain.js';
 import { registerGatewayRoutes } from './rest-plugin.js';
 import { registerZcashAmountRoutes } from './zcash-amount-routes.js';
+import { registerZcashBusRoutes } from './zcash-bus-routes.js';
 
 export async function buildGatewayApp(options = {}) {
 	const config = options.config ?? gatewayConfig;
@@ -79,6 +80,10 @@ export async function buildGatewayApp(options = {}) {
 	// on-chain index is disabled/empty.
 	registerZcashAmountRoutes(app, { config, ...(options.zecIndexDb !== undefined ? { indexDb: options.zecIndexDb } : {}) });
 
+	// Zcash "Bus Station" (free, non-custodial mixing coordination). OPT-IN:
+	// routes answer 503 until ZEC_BUS_ENABLED — a writable DB is required.
+	registerZcashBusRoutes(app, { config, ...(options.zecBusDb !== undefined ? { busDb: options.zecBusDb } : {}) });
+
 	app.get('/', async () => ({
 		service: config.serviceName,
 		version: config.apiVersion,
@@ -92,6 +97,9 @@ export async function buildGatewayApp(options = {}) {
 			'GET /v1/zec/amount-advice (free — shield/deshield amount-privacy advisor)',
 			'GET /v1/zec/split-plan (free — split a large shield/deshield into blend-in pieces)',
 			'GET /v1/zec/popular-amounts (free — on-chain popular shield/deshield amounts)',
+			'GET /v1/zec/bus (free — list non-custodial Zcash mixing "buses"; opt-in)',
+			'POST /v1/zec/bus/join (free — reserve a seat on a mixing bus; opt-in)',
+			'POST /v1/zec/bus/seat/:id/board|leave (free — manage your seat; opt-in)',
 			'POST /v1/private/watch (x402 paywall — view-key payment monitor)',
 			'POST /v1/private/topup|topup-1|topup-5|topup-custom (x402 paywall — credit top-ups)',
 			'POST /v1/private/topup-crypto (free — pay in XMR/ZEC)',

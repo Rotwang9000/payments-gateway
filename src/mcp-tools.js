@@ -74,6 +74,28 @@ import {
 	SHIELD_SIDES,
 	DEFAULT_POPULAR_LIMIT
 } from './zcash-shield-index.js';
+import {
+	BUS_CONSTANTS,
+	BUS_CAVEATS,
+	validateRoute,
+	validateAmount,
+	validateMinPassengers,
+	normaliseBusHandle,
+	normaliseNote,
+	buildBusSummary,
+	buildSeatSummary,
+	verifyOwner
+} from './zcash-bus.js';
+import {
+	openSharedBusDb,
+	listBusViews,
+	getBusView,
+	getSeatRow,
+	getBusRow,
+	joinBus,
+	setSeatStatus,
+	statsSnapshot as busStatsSnapshot
+} from './zcash-bus-store.js';
 
 export function asContent(obj) {
 	return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
@@ -969,6 +991,149 @@ export function registerZcashAmountMcpTools(server, opts = {}) {
 }
 
 /**
+ * Zcash "Bus Station" — non-custodial mixing coordination tools (OPT-IN).
+ *
+ * A rendezvous, NOT a tumbler: the gateway holds no funds/keys and stores no
+ * destinations/txids — it only matches riders by (route, blend-in amount, min
+ * passengers) and tracks a departure window. Each rider broadcasts their OWN
+ * swap. Registered only when a bus DB is configured/injected.
+ *
+ * opts:
+ *   - config      gateway config (defaults to standalone config)
+ *   - busDb       inject an open bus DB (tests); else opened from config
+ *   - toolPrefix  tool-name prefix (default 'gateway')
+ */
+export function registerZcashBusMcpTools(server, opts = {}) {
+	const config = opts.config ?? gatewayConfig;
+	const prefix = opts.toolPrefix ?? 'gateway';
+	const injected = opts.busDb;
+	const fillTtlMs = config.zecBusFillTtlMs ?? BUS_CONSTANTS.FILL_TTL_MS;
+	const departWindowMs = config.zecBusDepartWindowMs ?? BUS_CONSTANTS.DEPART_WINDOW_MS;
+	function db() {
+		if (injected !== undefined) return injected;
+		return openSharedBusDb(config.zecBusDbPath);
+	}
+	const NO_DB = { error: { code: 'bus_not_enabled', message: 'Bus coordination is not enabled on this server.' } };
+
+	server.registerTool(`${prefix}_zec_bus_list`, {
+		title: 'Zcash mixing bus — list open coordination "buses" (FREE)',
+		description: 'List open Zcash "buses": cohorts of users who will each leave the Zcash pool by swapping the SAME blend-in amount on the SAME route within a SHORT window, so their swaps look identical on-chain (anonymity set = bus size). NON-CUSTODIAL: nobody pools funds; each rider broadcasts their own swap from their own wallet. Returns each bus\'s route, per-rider amount, seats filled / minimum, status (boarding/ready), and an honest privacy read. Free; no wallet or payment.',
+		inputSchema: {
+			to: z.string().optional().describe('OPTIONAL: only buses swapping to this destination asset, CHAIN.TICKER e.g. BTC.BTC.'),
+			includeClosed: z.boolean().optional().describe('Include departed/expired buses (default false).'),
+			limit: z.number().int().min(1).max(200).optional().describe('Max buses to return (default 50).')
+		}
+	}, async (params) => {
+		const handle = db();
+		if (!handle) return asContent(NO_DB);
+		let route = null;
+		try { if (params.to) route = validateRoute({ to: params.to }).route; }
+		catch (err) { return asContent({ error: { code: 'bad_route', message: err.message } }); }
+		const views = listBusViews(handle, { route, includeClosed: Boolean(params.includeClosed), departWindowMs, limit: params.limit ?? BUS_CONSTANTS.LIST_DEFAULT_LIMIT });
+		return asContent({
+			buses: views.map((v) => buildBusSummary(v.bus, { boarded: v.boarded, departed: v.departed })),
+			stats: busStatsSnapshot(handle),
+			caveats: BUS_CAVEATS
+		});
+	});
+
+	server.registerTool(`${prefix}_zec_bus_join`, {
+		title: 'Zcash mixing bus — reserve a seat (FREE, non-custodial)',
+		description: 'Reserve a seat on a Zcash mixing bus for a given destination + blend-in amount (joins an existing boarding bus or starts a new one). You receive an OWNER TOKEN — keep it; it is the only way to later board, leave, or mark your seat departed, and it is shown only once. NON-CUSTODIAL: this sends no funds and shares no keys, addresses, or txids with the server. When the bus reaches its minimum and turns "ready", broadcast YOUR OWN swap of this exact amount/route during the departure window. The amount MUST be a blend-in denomination (a bus of identical odd amounts is just a shared fingerprint).',
+		inputSchema: {
+			to: z.string().describe('Destination asset to swap your ZEC into, CHAIN.TICKER e.g. BTC.BTC, ETH.ETH, THOR.RUNE.'),
+			amountZec: z.number().positive().describe('Per-rider amount of ZEC each passenger leaves the pool with. Must be a blend-in denomination (e.g. 0.1, 0.5, 1, 5, 10).'),
+			minPassengers: z.number().int().min(2).max(50).optional().describe('Minimum riders before the bus departs (default 5; bigger hides you better but fills slower).'),
+			handle: z.string().max(48).optional().describe('OPTIONAL 90s-style rider handle shown on the bus (default "anon"). Not an identity — pick anything.'),
+			note: z.string().max(120).optional().describe('OPTIONAL short public label. NEVER put an address here — destinations are deliberately never stored.')
+		}
+	}, async (params) => {
+		const handle = db();
+		if (!handle) return asContent(NO_DB);
+		let route; let amountZat; let minPassengers;
+		try {
+			route = validateRoute({ to: params.to });
+			amountZat = validateAmount(params.amountZec, { popular: null });
+			minPassengers = validateMinPassengers(params.minPassengers);
+		} catch (err) {
+			return asContent({ error: { code: 'bad_request', message: err.message } });
+		}
+		const res = joinBus(handle, {
+			route: route.route,
+			fromAsset: route.from,
+			toAsset: route.to,
+			amountZat,
+			minPassengers,
+			handle: normaliseBusHandle(params.handle),
+			note: normaliseNote(params.note),
+			fillTtlMs,
+			departWindowMs
+		});
+		return asContent({
+			joined: true,
+			owner_token: res.ownerToken,
+			owner_token_note: 'Save this token. It authorises board/leave/depart on your seat and is shown only once.',
+			seat: buildSeatSummary(res.seat),
+			bus: buildBusSummary(res.bus, { boarded: res.boarded, departed: res.departed }),
+			next: 'When the bus status is "ready", broadcast your own swap of this exact amount/route during the departure window, then call zec_bus_board (or zec_bus_status to watch it fill).',
+			caveats: BUS_CAVEATS
+		});
+	});
+
+	server.registerTool(`${prefix}_zec_bus_status`, {
+		title: 'Zcash mixing bus — bus + seat status (FREE)',
+		description: 'Get the live status of a Zcash mixing bus by id: route, per-rider amount, seats filled / minimum, whether it is boarding or ready to depart, the departure window, and an honest privacy read. Optionally pass your seatId + owner token to also see your own seat.',
+		inputSchema: {
+			busId: z.string().describe('The bus id (from zec_bus_list or zec_bus_join).'),
+			seatId: z.string().optional().describe('OPTIONAL: your seat id, to include your seat status.'),
+			ownerToken: z.string().optional().describe('OPTIONAL: your seat owner token (required to reveal your seat).')
+		}
+	}, async (params) => {
+		const handle = db();
+		if (!handle) return asContent(NO_DB);
+		const view = getBusView(handle, params.busId, { departWindowMs });
+		if (!view) return asContent({ error: { code: 'not_found', message: `no bus "${params.busId}"` } });
+		const out = { bus: buildBusSummary(view.bus, { boarded: view.boarded, departed: view.departed }), caveats: BUS_CAVEATS };
+		if (params.seatId && params.ownerToken) {
+			const seat = getSeatRow(handle, params.seatId);
+			if (seat && seat.bus_id === params.busId && verifyOwner(seat, params.ownerToken)) {
+				out.seat = buildSeatSummary(seat);
+			} else {
+				out.seat_error = 'seat not found or owner token did not match';
+			}
+		}
+		return asContent(out);
+	});
+
+	const seatActionTool = (name, status, title, description) => server.registerTool(`${prefix}_${name}`, {
+		title, description,
+		inputSchema: {
+			seatId: z.string().describe('Your seat id (from zec_bus_join).'),
+			ownerToken: z.string().describe('Your seat owner token (shown once when you joined).')
+		}
+	}, async (params) => {
+		const handle = db();
+		if (!handle) return asContent(NO_DB);
+		const res = setSeatStatus(handle, { seatId: params.seatId, token: params.ownerToken, status, departWindowMs });
+		if (!res.ok) return asContent({ ok: false, error: { code: 'seat_action_failed', message: res.reason } });
+		return asContent({
+			ok: true,
+			seat: buildSeatSummary(res.seat),
+			bus: res.bus ? buildBusSummary(res.bus, { boarded: res.boarded, departed: res.departed }) : null
+		});
+	});
+
+	seatActionTool('zec_bus_board', 'boarded',
+		'Zcash mixing bus — confirm you are boarded/ready (FREE)',
+		'Mark your seat as boarded once the bus is ready and you intend to broadcast your own swap in the departure window. Requires your seat id + owner token.');
+	seatActionTool('zec_bus_leave', 'left',
+		'Zcash mixing bus — leave a bus (FREE)',
+		'Withdraw your seat from a bus before it departs (frees the seat for the cohort count). Requires your seat id + owner token.');
+
+	return { names: ['zec_bus_list', 'zec_bus_join', 'zec_bus_status', 'zec_bus_board', 'zec_bus_leave'].map((n) => `${prefix}_${n}`) };
+}
+
+/**
  * Build a standalone MCP server (the winbit32 product): the Private Watch
  * tool family + a privacy-chain `q` tool + free paywall metadata.
  */
@@ -1056,6 +1221,17 @@ export function buildGatewayMcpServer(opts = {}) {
 			config,
 			toolPrefix: prefix,
 			...(opts.zecIndexDb !== undefined ? { indexDb: opts.zecIndexDb } : {})
+		});
+	}
+	// Zcash "Bus Station" — non-custodial mixing coordination. OPT-IN: a
+	// writable DB is required (no read-only fallback), so the family stays
+	// hidden unless the operator enables it (ZEC_BUS_ENABLED) or a DB is
+	// injected (tests). Keeps the default tool surface unchanged.
+	if (opts.zecBusDb !== undefined || config.zecBusEnabled) {
+		registerZcashBusMcpTools(server, {
+			config,
+			toolPrefix: prefix,
+			...(opts.zecBusDb !== undefined ? { busDb: opts.zecBusDb } : {})
 		});
 	}
 	return server;

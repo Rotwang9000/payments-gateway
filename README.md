@@ -75,6 +75,7 @@ arrive but can never move them.
 | utility | phrase validate/complete/generate, Shamir split/combine | none (local, offline) |
 | info | single-fact chain queries (height/fee/mempool) | none |
 | zcash amounts | `zec_amount_advice`, `zec_split_plan`, `zec_popular_amounts` (REST `GET /v1/zec/amount-advice`, `/v1/zec/split-plan`, `/v1/zec/popular-amounts`) — "blend in" shield/deshield amount advice, a large-amount split planner, and the live popular-amount histogram | none (read); a zebra node + the index poller for live counts |
+| zcash bus (opt-in) | `zec_bus_list`, `zec_bus_join`, `zec_bus_status`, `zec_bus_board`, `zec_bus_leave` (REST `GET /v1/zec/bus`, `GET /v1/zec/bus/:id`, `POST /v1/zec/bus/join`, `POST /v1/zec/bus/seat/:id/board\|leave`) — **non-custodial** mixing coordination: many users leave the Zcash pool with the same blend-in amount/route in the same window so their swaps look identical on-chain. The gateway holds no funds/keys and stores no destinations/txids — pure rendezvous. | `ZEC_BUS_ENABLED=1` + a writable `ZEC_BUS_DB` (no read-only fallback) |
 
 ## Built on
 

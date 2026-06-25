@@ -16,6 +16,7 @@ export {
 	registerWalletKitMcpTools,
 	registerUtilityMcpTools,
 	registerZcashAmountMcpTools,
+	registerZcashBusMcpTools,
 	buildGatewayMcpServer,
 	startGatewayMcpHttpServer
 } from './mcp-tools.js';
@@ -207,3 +208,31 @@ export {
 } from './zcash-shield-index.js';
 
 export { registerZcashAmountRoutes } from './zcash-amount-routes.js';
+
+export {
+	BUS_CONSTANTS,
+	BUS_STATUS,
+	SEAT_STATUS,
+	BUS_CAVEATS,
+	validateRoute as validateBusRoute,
+	validateAmount as validateBusAmount,
+	validateMinPassengers as validateBusMinPassengers,
+	effectiveBusStatus,
+	assessBusPrivacy,
+	buildBusSummary,
+	buildSeatSummary
+} from './zcash-bus.js';
+
+export {
+	openBusDb,
+	openSharedBusDb,
+	joinBus,
+	setSeatStatus,
+	listBusViews,
+	getBusView,
+	refreshBus,
+	expireStale as expireStaleBuses,
+	statsSnapshot as busStatsSnapshot
+} from './zcash-bus-store.js';
+
+export { registerZcashBusRoutes } from './zcash-bus-routes.js';
