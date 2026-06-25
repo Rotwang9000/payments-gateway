@@ -61,6 +61,18 @@ import {
 	splitSecretHex,
 	combineSecretShares
 } from './utility-tools.js';
+import {
+	buildAmountAdvice,
+	COMMON_AMOUNTS_ZEC
+} from './zcash-amount-privacy.js';
+import {
+	openSharedShieldIndexDb,
+	buildPopularFeed,
+	exactCount,
+	statsSnapshot,
+	SHIELD_SIDES,
+	DEFAULT_POPULAR_LIMIT
+} from './zcash-shield-index.js';
 
 export function asContent(obj) {
 	return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
@@ -854,6 +866,92 @@ export function registerUtilityMcpTools(server, opts = {}) {
 }
 
 /**
+ * Register the Zcash amount-privacy advisor family on `server`. Both tools are
+ * FREE and local-first: the advice is pure math (no chain call), and when the
+ * operator has enabled + populated the shield-amount index they are enriched
+ * with the live on-chain popularity feed ("N others used this exact amount").
+ *
+ * opts:
+ *   - config       gateway config (defaults to standalone config)
+ *   - indexDb      inject an open shield-index DB (tests); else opened from
+ *                  config when ZEC_SHIELD_INDEX_ENABLED
+ *   - toolPrefix   tool-name prefix (default 'gateway')
+ */
+export function registerZcashAmountMcpTools(server, opts = {}) {
+	const config = opts.config ?? gatewayConfig;
+	const prefix = opts.toolPrefix ?? 'gateway';
+	const injected = opts.indexDb;
+	function db() {
+		if (injected !== undefined) return injected;
+		if (!config.zecShieldIndexEnabled) return null;
+		return openSharedShieldIndexDb(config.zecShieldIndexDbPath);
+	}
+	const liveFeed = (handle, { side, nearZat = null, limit = DEFAULT_POPULAR_LIMIT }) => {
+		if (!handle) return null;
+		try {
+			const feed = buildPopularFeed(handle, { side, nearZat, limit });
+			return feed.length ? feed : null;
+		} catch { return null; }
+	};
+
+	server.registerTool(`${prefix}_zec_amount_advice`, {
+		title: 'Zcash amount privacy — shield/deshield "blend in" advisor (FREE)',
+		description: 'Advise on a Zcash shield (t→z) or deshield (z→t) amount so it blends with the crowd instead of fingerprinting the user. Zcash hides amounts inside the pool, so the only leak is the TRANSPARENT boundary value. Given an amount + action this returns: nearby popular "blend-in" amounts (from real on-chain behaviour when the operator runs the shield-amount index, else a curated list), a round-trip self-dox risk assessment, and — if the user pastes their own shielded note values — whether deshielding any 1:1 would link a note to a transparent address (the "Wall of Shame" leak). Pure + free; no wallet, view key, or payment. Blending REDUCES linkability, it does not guarantee anonymity.',
+		inputSchema: {
+			amountZec: z.number().positive().describe('The amount of ZEC you intend to shield or deshield (e.g. 1.5).'),
+			action: z.enum(['shield', 'deshield']).default('deshield').describe('shield = move transparent ZEC into the pool (t→z); deshield = move shielded ZEC out to a transparent address (z→t).'),
+			noteAmountsZec: z.array(z.number().positive()).max(500).optional().describe('OPTIONAL: the ZEC values of your own shielded notes. Used only to warn about deshielding one 1:1 (a self-dox). Sent to the server in the clear — omit for sensitive wallets and rely on the in-app wizard which checks locally.'),
+			count: z.number().int().min(1).max(32).optional().describe('How many blend-in suggestions to return (default 6).')
+		}
+	}, async (params) => {
+		const action = params.action === 'shield' ? 'shield' : 'deshield';
+		const handle = db();
+		const popular = liveFeed(handle, { side: action, nearZat: Math.round(params.amountZec * 1e8) });
+		const advice = buildAmountAdvice({
+			amountZec: params.amountZec,
+			action,
+			noteAmountsZec: params.noteAmountsZec ?? [],
+			popular,
+			count: params.count ?? 6
+		});
+		if (handle) {
+			try { advice.others_used_exact = exactCount(handle, { side: action, amountZat: advice.amount_zats }); }
+			catch { /* degrade silently */ }
+		}
+		return asContent(advice);
+	});
+
+	server.registerTool(`${prefix}_zec_popular_amounts`, {
+		title: 'Zcash amount privacy — popular shield/deshield amounts (FREE)',
+		description: 'Return the amounts people most commonly shield or deshield, so a wallet can pick one with a large crowd to hide in. When the operator runs the on-chain shield-amount index this is REAL data from the zebra node (each amount carries the number of observed crossings); otherwise it is a curated list of human round numbers. Optionally pass `nearZec` to rank by closeness to a target amount. Free — no node, key or payment on the caller side.',
+		inputSchema: {
+			side: z.enum(['shield', 'deshield']).default('deshield').describe('Which boundary to summarise: amounts shielded (t→z) or deshielded (z→t).'),
+			nearZec: z.number().positive().optional().describe('OPTIONAL: rank popular amounts by closeness to this ZEC amount instead of by raw popularity.'),
+			limit: z.number().int().min(1).max(64).optional().describe('Max amounts to return (default 16).')
+		}
+	}, async (params) => {
+		const side = SHIELD_SIDES.includes(params.side) ? params.side : 'deshield';
+		const limit = Math.min(64, Math.max(1, params.limit ?? DEFAULT_POPULAR_LIMIT));
+		const handle = db();
+		const nearZat = params.nearZec != null ? Math.round(params.nearZec * 1e8) : null;
+		const feed = liveFeed(handle, { side, nearZat, limit });
+		if (feed) {
+			return asContent({ side, source: 'live_index', amounts: feed, stats: statsSnapshot(handle) });
+		}
+		return asContent({
+			side,
+			source: 'bundled_list',
+			amounts: COMMON_AMOUNTS_ZEC.map((zec) => ({ zec, zats: Math.round(zec * 1e8), count: null })),
+			note: config.zecShieldIndexEnabled
+				? 'On-chain index not populated yet; returning the curated blend-in list.'
+				: 'On-chain index disabled on this server; returning the curated blend-in list.'
+		});
+	});
+
+	return { names: ['zec_amount_advice', 'zec_popular_amounts'].map((n) => `${prefix}_${n}`) };
+}
+
+/**
  * Build a standalone MCP server (the winbit32 product): the Private Watch
  * tool family + a privacy-chain `q` tool + free paywall metadata.
  */
@@ -933,6 +1031,15 @@ export function buildGatewayMcpServer(opts = {}) {
 	// `utilityTools: false` drops them.
 	if (opts.utilityTools !== false) {
 		registerUtilityMcpTools(server, { toolPrefix: prefix });
+	}
+	// Zcash amount-privacy advisor (free; pure advice + live popularity feed
+	// when the shield-amount index is enabled). `zcashAmountTools: false` drops.
+	if (opts.zcashAmountTools !== false) {
+		registerZcashAmountMcpTools(server, {
+			config,
+			toolPrefix: prefix,
+			...(opts.zecIndexDb !== undefined ? { indexDb: opts.zecIndexDb } : {})
+		});
 	}
 	return server;
 }

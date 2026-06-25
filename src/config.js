@@ -221,6 +221,26 @@ export function buildConfig(env = process.env) {
 		chainCacheTtlMs: asInt(env, 'CHAIN_CACHE_TTL_MS', 10_000),
 		chainRpcTimeoutMs: asInt(env, 'CHAIN_RPC_TIMEOUT_MS', 4_000),
 
+		// ── Zcash shield-amount index (popular blend-in amounts) ──────
+		// Builds a histogram of the transparent boundary amounts people shield
+		// (t→z) and deshield (z→t) from the zebra node, so the amount-privacy
+		// advisor can suggest amounts a real crowd uses and answer "N others
+		// used this exact amount". The READ side (/v1/zec/amount-advice and
+		// /v1/zec/popular-amounts, the zec_amount_advice + zec_popular_amounts
+		// MCP tools) is always on — it just returns the bundled list until the
+		// poller has populated the index. The SCANNER is the
+		// gateway-zec-shield-index-poller bin, driven by a systemd .timer; it
+		// resumes from a cursor and walks `maxBlocksPerTick` each run. When the
+		// cursor is empty and fromHeight is 0 the poller seeds the start at
+		// tip − windowBlocks (a rolling recent window — recent behaviour is the
+		// most useful crowd to blend into).
+		zecShieldIndexEnabled: asFlag(env, 'ZEC_SHIELD_INDEX_ENABLED', false),
+		zecShieldIndexDbPath: asString(env, ['ZEC_SHIELD_INDEX_DB', 'GATEWAY_ZEC_SHIELD_INDEX_DB'], '/var/lib/payments-gateway/zec-shield-index.db'),
+		zecShieldIndexFromHeight: asInt(env, 'ZEC_SHIELD_INDEX_FROM_HEIGHT', 0),
+		zecShieldIndexWindowBlocks: asInt(env, 'ZEC_SHIELD_INDEX_WINDOW_BLOCKS', 100_000),
+		zecShieldIndexMaxBlocksPerTick: asInt(env, 'ZEC_SHIELD_INDEX_MAX_BLOCKS_PER_TICK', 2_000),
+		zecShieldIndexMinBoundaryZat: asInt(env, 'ZEC_SHIELD_INDEX_MIN_BOUNDARY_ZAT', 100_000),
+
 		// ── NFPT view-key scanner ─────────────────────────────────────
 		nfptBaseUrl: asString(env, 'NFPT_BASE_URL', 'http://127.0.0.1:3555'),
 		nfptApiKey: asString(env, 'NFPT_API_KEY', 'development-key-for-testing'),

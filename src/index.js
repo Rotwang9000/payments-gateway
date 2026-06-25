@@ -15,6 +15,7 @@ export {
 	registerMakePaymentMcpTools,
 	registerWalletKitMcpTools,
 	registerUtilityMcpTools,
+	registerZcashAmountMcpTools,
 	buildGatewayMcpServer,
 	startGatewayMcpHttpServer
 } from './mcp-tools.js';
@@ -163,3 +164,46 @@ export {
 	dispatchChainQuestion,
 	createChainCache
 } from './queries-q-chain.js';
+
+// ── Zcash amount-privacy advisor (blend-in amounts) + on-chain index ──
+export {
+	ZATOSHIS_PER_ZEC,
+	COMMON_AMOUNTS_ZEC,
+	MIN_BOUNDARY_ZAT_DEFAULT,
+	zecToZats,
+	zatsToZec,
+	formatZec,
+	isCommonAmount,
+	suggestAmounts,
+	classifyAmount,
+	assessRoundTripRisk,
+	summariseNoteAmounts,
+	assessNotePrivacy,
+	parseAmountList,
+	buildAmountAdvice,
+	classifyBoundaryTx,
+	txNetShieldedZat,
+	transparentVoutZat,
+	transparentVinCount,
+	isCoinbaseTx,
+	hasShieldedComponent
+} from './zcash-amount-privacy.js';
+
+export {
+	SHIELD_SIDES,
+	openShieldIndexDb,
+	openSharedShieldIndexDb,
+	bumpAmount,
+	popularAmounts,
+	nearbyAmounts,
+	exactCount,
+	statsSnapshot as shieldIndexStatsSnapshot,
+	buildPopularFeed,
+	pruneRareAmounts,
+	getCursor as shieldIndexGetCursor,
+	setCursor as shieldIndexSetCursor,
+	fetchTipHeight,
+	scanShieldAmounts
+} from './zcash-shield-index.js';
+
+export { registerZcashAmountRoutes } from './zcash-amount-routes.js';

@@ -74,6 +74,7 @@ arrive but can never move them.
 | wallet | balances, scan jobs, UTXOs, broadcast | view keys only |
 | utility | phrase validate/complete/generate, Shamir split/combine | none (local, offline) |
 | info | single-fact chain queries (height/fee/mempool) | none |
+| zcash amounts | `zec_amount_advice`, `zec_popular_amounts` (REST `GET /v1/zec/amount-advice`, `/v1/zec/popular-amounts`) — "blend in" shield/deshield amount advice + the live popular-amount histogram | none (read); a zebra node + the index poller for live counts |
 
 ## Built on
 
@@ -101,6 +102,7 @@ One source of truth, assembled from already-public packages:
 | One-off historical view-key scans (spendable/spent notes) | ✅ |
 | Free view-key derivation from a phrase (rate-limited) | ✅ |
 | Single-fact ("Penny Oracle") privacy-chain queries (height/fee/mempool) | ✅ |
+| Zcash amount-privacy advisor (free): "blend in" shield/deshield amounts + round-trip self-dox warning, with a live on-chain popular-amount index ("N others used this") | ✅ |
 | **Make** outbound **ZEC** payments via FROST co-signing, with `cosignUrl` deep links | ✅ |
 | Wallet view-key tools (`*_zec_scan_*`, `*_zec_utxos`, `*_zec_broadcast`, `*_xmr_scan_*`) | ✅ |
 | Utility tools: `phrase_validate/complete/generate`, `shamir_split/combine` — local + offline | ✅ |
@@ -116,6 +118,7 @@ node bin/mcp.mjs     # MCP server for agents (Streamable HTTP)
 node bin/rest.mjs    # REST + x402 paywall
 node bin/private-watch-poller.mjs    # watch poller (cron-style)
 node bin/crypto-recv-poller.mjs      # XMR/ZEC top-up poller
+node bin/zec-shield-index-poller.mjs # Zcash shield-amount index (opt-in)
 ```
 
 Agent config:
@@ -208,6 +211,12 @@ Environment-driven via `src/config.js` (`buildConfig(env)`). Key groups:
 - **Scanner backend**: `NFPT_BASE_URL`, `NFPT_API_KEY`
 - **Private watch**: `PRIVATE_WATCH_DB`, `PRIVATE_WATCH_ENCRYPTION_KEY`
 - **Privacy RPC**: `MONERO_RPC_URL`, `ZCASH_RPC_URL`
+- **Zcash shield-amount index** *(read always on; scanner opt-in)*:
+  `ZEC_SHIELD_INDEX_ENABLED`, `ZEC_SHIELD_INDEX_DB`,
+  `ZEC_SHIELD_INDEX_FROM_HEIGHT` / `ZEC_SHIELD_INDEX_WINDOW_BLOCKS`,
+  `ZEC_SHIELD_INDEX_MAX_BLOCKS_PER_TICK`, `ZEC_SHIELD_INDEX_MIN_BOUNDARY_ZAT`
+  (drives the `zec_amount_advice` / `zec_popular_amounts` tools + `/v1/zec/*`
+  routes; reads the zebra node, no view keys)
 - **XMR/ZEC top-ups**: `XMR_RECV_ADDRESS` + `XMR_RECV_VIEW_KEY`,
   `ZEC_RECV_ADDRESS` + `ZEC_RECV_UFVK`, `CRYPTO_TOPUP_*`
 - **Make payments (ZEC co-sign)**: `MAKE_PAYMENT_WULT_PATH` (+ optional

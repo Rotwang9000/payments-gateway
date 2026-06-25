@@ -15,6 +15,7 @@ import gatewayConfig from './config.js';
 import { buildX402Config, registerX402, describePaywall } from './x402.js';
 import { CHAIN_QUESTION_REGISTRY } from './queries-q-chain.js';
 import { registerGatewayRoutes } from './rest-plugin.js';
+import { registerZcashAmountRoutes } from './zcash-amount-routes.js';
 
 export async function buildGatewayApp(options = {}) {
 	const config = options.config ?? gatewayConfig;
@@ -73,6 +74,11 @@ export async function buildGatewayApp(options = {}) {
 	// cross-cutting routes below.
 	const gateway = registerGatewayRoutes(app, { ...options, config, x402Cfg });
 
+	// Zcash amount-privacy advisor (free): suggestions + round-trip risk and the
+	// live popular-amount feed. Always on — degrades to the bundled list when the
+	// on-chain index is disabled/empty.
+	registerZcashAmountRoutes(app, { config, ...(options.zecIndexDb !== undefined ? { indexDb: options.zecIndexDb } : {}) });
+
 	app.get('/', async () => ({
 		service: config.serviceName,
 		version: config.apiVersion,
@@ -83,6 +89,8 @@ export async function buildGatewayApp(options = {}) {
 			'GET /v1/q (privacy-chain penny-oracle catalogue, free)',
 			'GET /v1/q/xmr/* (Monero atomic facts, x402 paywall)',
 			'GET /v1/q/zec/* (Zcash atomic facts, x402 paywall)',
+			'GET /v1/zec/amount-advice (free — shield/deshield amount-privacy advisor)',
+			'GET /v1/zec/popular-amounts (free — on-chain popular shield/deshield amounts)',
 			'POST /v1/private/watch (x402 paywall — view-key payment monitor)',
 			'POST /v1/private/topup|topup-1|topup-5|topup-custom (x402 paywall — credit top-ups)',
 			'POST /v1/private/topup-crypto (free — pay in XMR/ZEC)',

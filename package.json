@@ -1,6 +1,6 @@
 {
 	"name": "payments-gateway",
-	"version": "0.6.0",
+	"version": "0.7.0",
 	"description": "Generic MCP + REST payments gateway. Charge for any service two ways: direct payment with confirmation (x402 USDC per-call; co-signed outbound ZEC where a human approves each spend) or top-up & use (prepaid credit meters fed by x402 or native XMR/ZEC payments, watched via view keys only). Embed it in your own server or run it standalone for your agents. Built on x402-server-kit + viewkey-watch.",
 	"type": "module",
 	"license": "MIT",
@@ -12,7 +12,8 @@
 		"gateway-rest": "bin/rest.mjs",
 		"gateway-mcp": "bin/mcp.mjs",
 		"gateway-private-watch-poller": "bin/private-watch-poller.mjs",
-		"gateway-crypto-recv-poller": "bin/crypto-recv-poller.mjs"
+		"gateway-crypto-recv-poller": "bin/crypto-recv-poller.mjs",
+		"gateway-zec-shield-index-poller": "bin/zec-shield-index-poller.mjs"
 	},
 	"exports": {
 		".": "./src/index.js",
@@ -24,6 +25,7 @@
 		"start:mcp": "node bin/mcp.mjs",
 		"poll:watches": "node bin/private-watch-poller.mjs",
 		"poll:crypto-recv": "node bin/crypto-recv-poller.mjs",
+		"poll:zec-shield-index": "node bin/zec-shield-index-poller.mjs",
 		"test": "node --experimental-vm-modules node_modules/.bin/jest",
 		"test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch"
 	},
