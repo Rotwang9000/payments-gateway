@@ -20,8 +20,10 @@ import {
 	verifyOwner,
 	effectiveBusStatus,
 	isJoinable,
-	busMatchKey
+	busMatchKey,
+	busKeyForBus
 } from './zcash-bus.js';
+import { claimNullifier, releaseNullifier } from './zcash-bus-nullifiers.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS buses (
@@ -48,10 +50,23 @@ CREATE TABLE IF NOT EXISTS bus_seats (
 	note             TEXT,
 	owner_token_hash TEXT NOT NULL,
 	status           TEXT NOT NULL DEFAULT 'reserved',
+	nullifier        TEXT,
 	created_ms       INTEGER NOT NULL,
 	updated_ms       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_seats_bus ON bus_seats(bus_id, status);
+
+-- Anti-sybil (P4c): one anonymous identity -> one seat per bus. A seat claim in
+-- sybil mode reveals a per-bus nullifier; we reject a repeat on the same
+-- bus_key. PK enforces dedupe even under concurrent writers. Stores no identity
+-- (the nullifier is unlinkable across buses by construction).
+CREATE TABLE IF NOT EXISTS bus_nullifiers (
+	bus_key     TEXT NOT NULL,
+	nullifier   TEXT NOT NULL,
+	seat_id     TEXT,
+	created_ms  INTEGER NOT NULL,
+	PRIMARY KEY (bus_key, nullifier)
+);
 `;
 
 const ACTIVE_SEAT_STATUSES = [SEAT_STATUS.RESERVED, SEAT_STATUS.BOARDED];
@@ -61,7 +76,17 @@ export function openBusDb(path = ':memory:') {
 	db.pragma('journal_mode = WAL');
 	db.pragma('busy_timeout = 3000');
 	db.exec(SCHEMA);
+	migrate(db);
 	return db;
+}
+
+// Idempotent migrations for DBs created before a column existed (CREATE TABLE IF
+// NOT EXISTS never alters an existing table). Cheap to run on every open.
+function migrate(db) {
+	const seatCols = new Set(db.prepare('PRAGMA table_info(bus_seats)').all().map((c) => c.name));
+	if (!seatCols.has('nullifier')) {
+		db.exec('ALTER TABLE bus_seats ADD COLUMN nullifier TEXT');
+	}
 }
 
 // One shared writable handle per path, so the per-request MCP server instances
@@ -163,6 +188,24 @@ export function createBus(db, { route, fromAsset, toAsset, amountZat, minPasseng
 }
 
 /**
+ * Find the oldest joinable bus for a cohort, or create one — WITHOUT seating
+ * anyone. Used by the sybil flow's "open" step so a rider can read the bus's
+ * public `bus_key` and build a membership proof bound to it before claiming a
+ * seat (which they can't pre-compute for a bus id that doesn't exist yet).
+ * @returns {{ bus: object, reused: boolean, boarded: number, departed: number }}
+ */
+export function findOrCreateBus(db, { route, fromAsset, toAsset, amountZat, minPassengers, nowMs = Date.now(), fillTtlMs = BUS_CONSTANTS.FILL_TTL_MS, departWindowMs = BUS_CONSTANTS.DEPART_WINDOW_MS } = {}) {
+	const txn = db.transaction(() => {
+		let bus = findJoinableBus(db, { route, amountZat, minPassengers, nowMs });
+		const reused = !!bus;
+		if (!bus) bus = createBus(db, { route, fromAsset, toAsset, amountZat, minPassengers, nowMs, fillTtlMs });
+		const refreshed = refreshBus(db, bus.id, { nowMs, departWindowMs });
+		return { bus: refreshed.bus, reused, boarded: refreshed.boarded, departed: refreshed.departed };
+	});
+	return txn();
+}
+
+/**
  * Reserve a seat on a bus: find a matching boarding bus or create one, insert a
  * reserved seat, refresh status (may flip to ready). Atomic.
  * @returns {{ bus: object, seat: object, ownerToken: string, boarded: number, departed: number }}
@@ -177,19 +220,49 @@ export function joinBus(db, {
 	note = null,
 	nowMs = Date.now(),
 	fillTtlMs = BUS_CONSTANTS.FILL_TTL_MS,
-	departWindowMs = BUS_CONSTANTS.DEPART_WINDOW_MS
+	departWindowMs = BUS_CONSTANTS.DEPART_WINDOW_MS,
+	// Anti-sybil (P4c), optional. When provided, the rider's membership proof has
+	// ALREADY been verified by the caller (async snarkjs lives in the route layer,
+	// not in this synchronous txn); we only enforce the one-seat-per-bus dedupe
+	// here, atomically with the seat insert. `busId` pins the exact bus the proof
+	// was bound to, `nullifier` is the per-bus tag to burn.
+	busId = null,
+	nullifier = null
 } = {}) {
 	const ownerToken = genOwnerToken();
+	const sybil = nullifier != null;
 	const txn = db.transaction(() => {
-		let bus = findJoinableBus(db, { route, amountZat, minPassengers, nowMs });
-		if (!bus) {
-			bus = createBus(db, { route, fromAsset, toAsset, amountZat, minPassengers, nowMs, fillTtlMs });
+		let bus;
+		if (sybil) {
+			// Sybil mode rides a SPECIFIC, already-existing bus (the one whose
+			// bus_key the proof bound to) — never find-or-create, or the proof's
+			// busKey wouldn't match the seat's bus.
+			if (!busId) throw new TypeError('sybil join requires busId');
+			bus = getBusRow(db, busId);
+			if (!bus) throw new TypeError('bus not found');
+			const view = refreshBus(db, bus, { nowMs, departWindowMs });
+			bus = view.bus;
+			if (!isJoinable(bus.status) || view.boarded >= BUS_CONSTANTS.MAX_SEATS) {
+				throw new TypeError('bus is not accepting seats');
+			}
+			const busKey = busKeyForBus(bus);
+			const claimed = claimNullifier(db, busKey, nullifier, { seatId: null, nowMs });
+			if (!claimed.ok) throw new TypeError(`seat refused: ${claimed.reason}`);
+		} else {
+			bus = findJoinableBus(db, { route, amountZat, minPassengers, nowMs });
+			if (!bus) {
+				bus = createBus(db, { route, fromAsset, toAsset, amountZat, minPassengers, nowMs, fillTtlMs });
+			}
 		}
 		const seatId = genSeatId();
 		db.prepare(
-			`INSERT INTO bus_seats (id, bus_id, handle, note, owner_token_hash, status, created_ms, updated_ms)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-		).run(seatId, bus.id, handle, note, hashToken(ownerToken), SEAT_STATUS.RESERVED, nowMs, nowMs);
+			`INSERT INTO bus_seats (id, bus_id, handle, note, owner_token_hash, status, nullifier, created_ms, updated_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		).run(seatId, bus.id, handle, note, hashToken(ownerToken), SEAT_STATUS.RESERVED, sybil ? String(nullifier) : null, nowMs, nowMs);
+		if (sybil) {
+			db.prepare('UPDATE bus_nullifiers SET seat_id = ? WHERE bus_key = ? AND nullifier = ?')
+				.run(seatId, busKeyForBus(bus), String(nullifier));
+		}
 		const refreshed = refreshBus(db, bus.id, { nowMs, departWindowMs });
 		const seat = getSeatRow(db, seatId);
 		return { bus: refreshed.bus, seat, boarded: refreshed.boarded, departed: refreshed.departed };
@@ -212,6 +285,12 @@ export function setSeatStatus(db, { seatId, token, status, nowMs = Date.now(), d
 	if (!seat) return { ok: false, reason: 'seat not found' };
 	if (!verifyOwner(seat, token)) return { ok: false, reason: 'not authorised (bad owner token)' };
 	db.prepare('UPDATE bus_seats SET status = ?, updated_ms = ? WHERE id = ?').run(status, nowMs, seatId);
+	// A rider who LEAVES frees their anti-sybil nullifier so they can re-board
+	// elsewhere; one who DEPARTED keeps it burned (they used their seat).
+	if (status === SEAT_STATUS.LEFT && seat.nullifier) {
+		const bus = getBusRow(db, seat.bus_id);
+		if (bus) releaseNullifier(db, busKeyForBus(bus), seat.nullifier);
+	}
 	const refreshed = refreshBus(db, seat.bus_id, { nowMs, departWindowMs });
 	return { ok: true, seat: getSeatRow(db, seatId), bus: refreshed?.bus, boarded: refreshed?.boarded, departed: refreshed?.departed };
 }
@@ -284,6 +363,7 @@ export default {
 	refreshBus,
 	findJoinableBus,
 	createBus,
+	findOrCreateBus,
 	joinBus,
 	setSeatStatus,
 	listBusViews,

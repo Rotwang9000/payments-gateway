@@ -19,6 +19,7 @@
 // Everything here is pure + unit-testable. The SQLite side lives in
 // zcash-bus-store.js and the routes/MCP tools wire it up.
 
+import { createHash } from 'node:crypto';
 import {
 	genNoticeId,
 	genOwnerToken,
@@ -42,6 +43,10 @@ export const BUS_CONSTANTS = Object.freeze({
 	// always ZEC. The destination is any swap target the user's own wallet can
 	// reach (validated by format; the swap layer enforces real routes).
 	FROM_ASSET: 'ZEC.ZEC',
+	// Synthetic asset id for the *transparent* ZEC side, used only as a grouping
+	// key + label for shield/unshield buses (Zcash has no CHAIN.TICKER for
+	// "transparent vs shielded"). Matches ASSET_RE so it round-trips cleanly.
+	TRANSPARENT_ASSET: 'ZEC.T',
 	// CHAIN.TICKER, upper-case (e.g. BTC.BTC, ETH.ETH, THOR.RUNE, DASH.DASH).
 	ASSET_RE: /^[A-Z0-9]{2,10}\.[A-Z0-9.-]{1,40}$/u,
 	MIN_PASSENGERS_FLOOR: 2,
@@ -71,6 +76,19 @@ export const BUS_STATUS = Object.freeze({
 	DEPARTED: 'departed',
 	EXPIRED: 'expired',
 	CANCELLED: 'cancelled'
+});
+
+// What kind of pool boundary the cohort crosses together:
+//   swap     — leave the shielded pool by swapping ZEC → another chain (default).
+//   unshield — leave the shielded pool to *transparent* ZEC (z→t / deshield).
+//   shield   — enter the shielded pool from *transparent* ZEC (t→z).
+// Shield/unshield are the purest fix for the "Wall of Shame" self-dox: many
+// people cross the SAME boundary with the SAME round amount in the SAME window,
+// so the transparent legs all look alike instead of round-tripping 1:1.
+export const BUS_KIND = Object.freeze({
+	SWAP: 'swap',
+	UNSHIELD: 'unshield',
+	SHIELD: 'shield'
 });
 
 // Seat lifecycle:
@@ -128,7 +146,63 @@ export function validateRoute({ from = BUS_CONSTANTS.FROM_ASSET, to } = {}) {
 	if (toAsset === fromAsset) {
 		throw new TypeError('destination asset must differ from the source');
 	}
+	if (toAsset === BUS_CONSTANTS.TRANSPARENT_ASSET) {
+		throw new TypeError(`destination "${BUS_CONSTANTS.TRANSPARENT_ASSET}" is reserved for shield/unshield buses; use kind:"unshield" instead`);
+	}
 	return { from: fromAsset, to: toAsset, route: `${fromAsset}>${toAsset}` };
+}
+
+/** Normalise a requested bus kind ('swap' | 'unshield' | 'shield'). */
+export function normaliseBusKind(value) {
+	const k = String(value ?? BUS_KIND.SWAP).trim().toLowerCase();
+	if (k === BUS_KIND.SWAP || k === BUS_KIND.UNSHIELD || k === BUS_KIND.SHIELD) return k;
+	// tolerate the on-chain synonym
+	if (k === 'deshield') return BUS_KIND.UNSHIELD;
+	throw new TypeError(`invalid bus kind "${value}"; expected swap, unshield or shield`);
+}
+
+/**
+ * Validate a bus route for any kind. Swap routes go through validateRoute (and
+ * still require a destination asset); shield/unshield are pool moves whose
+ * "destination" is transparent/shielded ZEC, so they need no `to`.
+ * @returns {{ kind: string, from: string, to: string, route: string }}
+ */
+export function validateBusRoute({ kind = BUS_KIND.SWAP, to } = {}) {
+	const k = normaliseBusKind(kind);
+	if (k === BUS_KIND.SWAP) {
+		const r = validateRoute({ to });
+		return { kind: k, ...r };
+	}
+	const T = BUS_CONSTANTS.TRANSPARENT_ASSET;
+	const Z = BUS_CONSTANTS.FROM_ASSET;
+	if (k === BUS_KIND.UNSHIELD) return { kind: k, from: Z, to: T, route: `${Z}>${T}` };
+	return { kind: k, from: T, to: Z, route: `${T}>${Z}` }; // shield
+}
+
+/** Derive a bus kind from its stored from/to assets (pure; no DB column needed). */
+export function kindFromAssets(fromAsset, toAsset) {
+	const T = BUS_CONSTANTS.TRANSPARENT_ASSET;
+	const Z = BUS_CONSTANTS.FROM_ASSET;
+	if (fromAsset === Z && toAsset === T) return BUS_KIND.UNSHIELD;
+	if (fromAsset === T && toAsset === Z) return BUS_KIND.SHIELD;
+	return BUS_KIND.SWAP;
+}
+
+/**
+ * Display + grammar metadata for a kind: the plural noun used in privacy
+ * headlines ("look-alike unshields"), a short action verb, and a route label.
+ * @param {string} kind
+ * @param {string} [toAsset] swap destination, for the swap route label
+ */
+export function busKindMeta(kind, toAsset = null) {
+	switch (kind) {
+		case BUS_KIND.UNSHIELD:
+			return { kind, noun: 'unshields', action: 'unshield', toLabel: 'transparent ZEC', routeLabel: 'Unshield · shielded → transparent ZEC' };
+		case BUS_KIND.SHIELD:
+			return { kind, noun: 'shields', action: 'shield', toLabel: 'shielded ZEC', routeLabel: 'Shield · transparent → shielded ZEC' };
+		default:
+			return { kind: BUS_KIND.SWAP, noun: 'swaps', action: 'swap', toLabel: toAsset, routeLabel: toAsset ? `Swap out · ZEC → ${toAsset}` : 'Swap out' };
+	}
 }
 
 /**
@@ -185,6 +259,38 @@ export function busMatchKey({ route, amountZat, minPassengers }) {
 	return `${route}|${amountZat}|${minPassengers}`;
 }
 
+// ── busKey: the public, per-bus label the sybil proofs bind to ───────
+// BN254 / alt_bn128 scalar field — the field circom + snarkjs work in. This and
+// the descriptor below MUST stay byte-identical to zecbus's
+// reputation.canonicalBusDescriptor + busKeyFromDescriptor, or a rider's proof
+// (built against the bus they read from /v1/zec/bus) will bind to a different
+// key than the coordinator dedupes on. Pinned by a shared test vector in both
+// repos (test/zcash-bus-sybil.test.js ⇄ zecbus test/reputation.test.js).
+export const FIELD_PRIME =
+	21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+/** Canonical, public descriptor of a bus (no secrets) — matches zecbus 1:1. */
+export function busDescriptor(bus) {
+	const from = String(bus.from_asset ?? bus.from ?? BUS_CONSTANTS.FROM_ASSET);
+	const to = String(bus.to_asset ?? bus.to ?? '');
+	const amountZats = String(bus.amount_zat ?? bus.amountZats ?? bus.amount);
+	const id = String(bus.id);
+	if (!to || !id || amountZats === 'undefined') {
+		throw new TypeError('busDescriptor: bus needs { to, amount, id }');
+	}
+	return `zecbus:v2:${from}|${to}|${amountZats}|${id}`;
+}
+
+/**
+ * Deterministic per-bus field element the sybil membership proof's `busKey`
+ * public signal must equal. Returned as a decimal string (snarkjs/the client
+ * speak decimal strings), so callers compare with `String(bundle.busKey)`.
+ */
+export function busKeyForBus(bus) {
+	const hex = createHash('sha256').update(busDescriptor(bus), 'utf8').digest('hex');
+	return (BigInt('0x' + hex) % FIELD_PRIME).toString();
+}
+
 // ── lifecycle (pure status derivation) ──────────────────────────────
 
 /**
@@ -231,7 +337,7 @@ export function isJoinable(status) {
  * Honest anonymity read for a bus. The set is the number of distinct riders who
  * will actually broadcast — we can only show the seat count as an UPPER BOUND.
  */
-export function assessBusPrivacy({ status, boarded = 0, minPassengers = BUS_CONSTANTS.MIN_PASSENGERS_DEFAULT } = {}) {
+export function assessBusPrivacy({ status, boarded = 0, minPassengers = BUS_CONSTANTS.MIN_PASSENGERS_DEFAULT, noun = 'swaps' } = {}) {
 	const count = Number(boarded) || 0;
 	const min = Number(minPassengers) || BUS_CONSTANTS.MIN_PASSENGERS_DEFAULT;
 
@@ -245,7 +351,7 @@ export function assessBusPrivacy({ status, boarded = 0, minPassengers = BUS_CONS
 		return {
 			level: count >= 10 ? 'strong' : count >= 5 ? 'good' : 'fair',
 			anonymitySetMax: count,
-			headline: `Ready to depart — up to ${count} look-alike swaps (anonymity set ≤ ${count}, sybil-permitting).`
+			headline: `Ready to depart — up to ${count} look-alike ${noun} (anonymity set ≤ ${count}, sybil-permitting).`
 		};
 	}
 	return {
@@ -265,11 +371,21 @@ export function buildBusSummary(bus, { boarded = 0, departed = 0, nowMs = Date.n
 	const status = effectiveBusStatus(bus, { boarded, nowMs });
 	const min = Number(bus.min_passengers ?? BUS_CONSTANTS.MIN_PASSENGERS_DEFAULT);
 	const amountZat = Number(bus.amount_zat ?? 0);
+	const kind = kindFromAssets(bus.from_asset, bus.to_asset);
+	const meta = busKindMeta(kind, bus.to_asset);
 	return {
 		id: bus.id,
 		route: bus.route,
+		kind,
 		from: bus.from_asset,
 		to: bus.to_asset,
+		to_label: meta.toLabel,
+		route_label: meta.routeLabel,
+		action: meta.action,
+		// Public label a rider's anti-sybil membership proof must bind to. Always
+		// published (cheap, leaks nothing); only *enforced* when the operator wires
+		// a verifier (see zcash-bus-routes.js / config.zecBusSybilRequired).
+		bus_key: busKeyForBus(bus),
 		amount_zat: amountZat,
 		amount_zec: zatsToZec(amountZat),
 		amount_label: `${formatZec(amountZat)} ${bus.from_asset}`,
@@ -282,7 +398,7 @@ export function buildBusSummary(bus, { boarded = 0, departed = 0, nowMs = Date.n
 		ready_ms: bus.ready_ms != null ? Number(bus.ready_ms) : null,
 		depart_by_ms: bus.depart_by_ms != null ? Number(bus.depart_by_ms) : null,
 		expires_ms: bus.expires_ms != null ? Number(bus.expires_ms) : null,
-		privacy: assessBusPrivacy({ status, boarded, minPassengers: min })
+		privacy: assessBusPrivacy({ status, boarded, minPassengers: min, noun: meta.noun })
 	};
 }
 
@@ -302,6 +418,7 @@ export function buildSeatSummary(seat) {
 export default {
 	BUS_CONSTANTS,
 	BUS_STATUS,
+	BUS_KIND,
 	SEAT_STATUS,
 	BUS_CAVEATS,
 	genBusId,
@@ -311,11 +428,17 @@ export default {
 	verifyOwner,
 	normaliseAsset,
 	validateRoute,
+	normaliseBusKind,
+	validateBusRoute,
+	kindFromAssets,
+	busKindMeta,
 	validateAmount,
 	validateMinPassengers,
 	normaliseBusHandle,
 	normaliseNote,
 	busMatchKey,
+	busDescriptor,
+	busKeyForBus,
 	effectiveBusStatus,
 	isJoinable,
 	assessBusPrivacy,

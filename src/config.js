@@ -253,6 +253,12 @@ export function buildConfig(env = process.env) {
 		zecBusDbPath: asString(env, ['ZEC_BUS_DB', 'GATEWAY_ZEC_BUS_DB'], '/var/lib/payments-gateway/zec-bus.db'),
 		zecBusFillTtlMs: asInt(env, 'ZEC_BUS_FILL_TTL_MS', 24 * 60 * 60_000),
 		zecBusDepartWindowMs: asInt(env, 'ZEC_BUS_DEPART_WINDOW_MS', 20 * 60_000),
+		// Anti-sybil (P4c): when on, a seat claim REQUIRES a zk membership proof
+		// (one anonymous identity → one seat per bus). OFF by default — it needs a
+		// real trusted-setup ceremony + an injected verifier (registerZcashBusRoutes
+		// `verifyProof`), so the public good keeps working anonymously until then.
+		zecBusSybilRequired: asFlag(env, 'ZEC_BUS_SYBIL_REQUIRED', false),
+		zecBusVerificationKeyPath: asString(env, 'ZEC_BUS_VERIFICATION_KEY', ''),
 
 		// ── NFPT view-key scanner ─────────────────────────────────────
 		nfptBaseUrl: asString(env, 'NFPT_BASE_URL', 'http://127.0.0.1:3555'),

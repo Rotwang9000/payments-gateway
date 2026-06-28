@@ -77,7 +77,9 @@ import {
 import {
 	BUS_CONSTANTS,
 	BUS_CAVEATS,
+	BUS_KIND,
 	validateRoute,
+	validateBusRoute,
 	validateAmount,
 	validateMinPassengers,
 	normaliseBusHandle,
@@ -1019,7 +1021,8 @@ export function registerZcashBusMcpTools(server, opts = {}) {
 		title: 'Zcash mixing bus — list open coordination "buses" (FREE)',
 		description: 'List open Zcash "buses": cohorts of users who will each leave the Zcash pool by swapping the SAME blend-in amount on the SAME route within a SHORT window, so their swaps look identical on-chain (anonymity set = bus size). NON-CUSTODIAL: nobody pools funds; each rider broadcasts their own swap from their own wallet. Returns each bus\'s route, per-rider amount, seats filled / minimum, status (boarding/ready), and an honest privacy read. Free; no wallet or payment.',
 		inputSchema: {
-			to: z.string().optional().describe('OPTIONAL: only buses swapping to this destination asset, CHAIN.TICKER e.g. BTC.BTC.'),
+			kind: z.enum(['swap', 'unshield', 'shield']).optional().describe('OPTIONAL: filter by boundary kind — "swap" (ZEC→another chain), "unshield" (z→t / deshield) or "shield" (t→z).'),
+			to: z.string().optional().describe('OPTIONAL: for swap buses, only those to this destination asset, CHAIN.TICKER e.g. BTC.BTC.'),
 			includeClosed: z.boolean().optional().describe('Include departed/expired buses (default false).'),
 			limit: z.number().int().min(1).max(200).optional().describe('Max buses to return (default 50).')
 		}
@@ -1027,8 +1030,10 @@ export function registerZcashBusMcpTools(server, opts = {}) {
 		const handle = db();
 		if (!handle) return asContent(NO_DB);
 		let route = null;
-		try { if (params.to) route = validateRoute({ to: params.to }).route; }
-		catch (err) { return asContent({ error: { code: 'bad_route', message: err.message } }); }
+		try {
+			if (params.kind === BUS_KIND.SHIELD || params.kind === BUS_KIND.UNSHIELD) route = validateBusRoute({ kind: params.kind }).route;
+			else if (params.to) route = validateRoute({ to: params.to }).route;
+		} catch (err) { return asContent({ error: { code: 'bad_route', message: err.message } }); }
 		const views = listBusViews(handle, { route, includeClosed: Boolean(params.includeClosed), departWindowMs, limit: params.limit ?? BUS_CONSTANTS.LIST_DEFAULT_LIMIT });
 		return asContent({
 			buses: views.map((v) => buildBusSummary(v.bus, { boarded: v.boarded, departed: v.departed })),
@@ -1039,10 +1044,11 @@ export function registerZcashBusMcpTools(server, opts = {}) {
 
 	server.registerTool(`${prefix}_zec_bus_join`, {
 		title: 'Zcash mixing bus — reserve a seat (FREE, non-custodial)',
-		description: 'Reserve a seat on a Zcash mixing bus for a given destination + blend-in amount (joins an existing boarding bus or starts a new one). You receive an OWNER TOKEN — keep it; it is the only way to later board, leave, or mark your seat departed, and it is shown only once. NON-CUSTODIAL: this sends no funds and shares no keys, addresses, or txids with the server. When the bus reaches its minimum and turns "ready", broadcast YOUR OWN swap of this exact amount/route during the departure window. The amount MUST be a blend-in denomination (a bus of identical odd amounts is just a shared fingerprint).',
+		description: 'Reserve a seat on a Zcash mixing bus (joins an existing boarding bus or starts a new one). Choose the boundary you want to cross WITH others at the same blend-in amount + window: kind="swap" leaves the pool to another chain (give `to`), kind="unshield" deshields to transparent ZEC (z→t), kind="shield" enters the pool from transparent ZEC (t→z). Shield/unshield are the direct fix for the "Wall of Shame" self-dox (round-tripping a unique amount). You receive an OWNER TOKEN — keep it; it is the only way to board/leave/mark-departed and is shown only once. NON-CUSTODIAL: no funds, keys, addresses or txids are shared. When the bus turns "ready", broadcast YOUR OWN transaction of this exact amount during the window. The amount MUST be a blend-in denomination (a bus of identical odd amounts is just a shared fingerprint).',
 		inputSchema: {
-			to: z.string().describe('Destination asset to swap your ZEC into, CHAIN.TICKER e.g. BTC.BTC, ETH.ETH, THOR.RUNE.'),
-			amountZec: z.number().positive().describe('Per-rider amount of ZEC each passenger leaves the pool with. Must be a blend-in denomination (e.g. 0.1, 0.5, 1, 5, 10).'),
+			kind: z.enum(['swap', 'unshield', 'shield']).optional().describe('Boundary to cross: "swap" (default; ZEC→another chain, needs `to`), "unshield" (z→t / deshield), or "shield" (t→z).'),
+			to: z.string().optional().describe('For kind="swap": destination asset to swap your ZEC into, CHAIN.TICKER e.g. BTC.BTC, ETH.ETH, THOR.RUNE. Ignored for shield/unshield.'),
+			amountZec: z.number().positive().describe('Per-rider amount of ZEC each passenger crosses with. Must be a blend-in denomination (e.g. 0.1, 0.5, 1, 5, 10).'),
 			minPassengers: z.number().int().min(2).max(50).optional().describe('Minimum riders before the bus departs (default 5; bigger hides you better but fills slower).'),
 			handle: z.string().max(48).optional().describe('OPTIONAL 90s-style rider handle shown on the bus (default "anon"). Not an identity — pick anything.'),
 			note: z.string().max(120).optional().describe('OPTIONAL short public label. NEVER put an address here — destinations are deliberately never stored.')
@@ -1050,9 +1056,15 @@ export function registerZcashBusMcpTools(server, opts = {}) {
 	}, async (params) => {
 		const handle = db();
 		if (!handle) return asContent(NO_DB);
+		// Fail safe: when the operator requires anti-sybil proofs, anonymous seating
+		// is closed. Proving needs client-side artefacts (see zecbus `./browser`),
+		// so it runs over the REST /v1/zec/bus/open + /join flow, not this tool.
+		if (config.zecBusSybilRequired) {
+			return asContent({ error: { code: 'sybil_required', message: 'This server requires an anti-sybil membership proof to take a seat. Use the REST flow: POST /v1/zec/bus/open then /v1/zec/bus/join with a proof bundle (zecbus ./browser proveBusSeat).' } });
+		}
 		let route; let amountZat; let minPassengers;
 		try {
-			route = validateRoute({ to: params.to });
+			route = validateBusRoute({ kind: params.kind, to: params.to });
 			amountZat = validateAmount(params.amountZec, { popular: null });
 			minPassengers = validateMinPassengers(params.minPassengers);
 		} catch (err) {

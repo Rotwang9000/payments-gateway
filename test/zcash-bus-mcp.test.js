@@ -92,6 +92,16 @@ describe('zec_bus_* MCP tools (functional)', () => {
 		const res = await call(off, 'gateway_zec_bus_list', {});
 		expect(res.error.code).toBe('bus_not_enabled');
 	});
+
+	test('anonymous MCP join is closed when sybil proofs are required (fail safe)', async () => {
+		const gated = fakeServer();
+		registerZcashBusMcpTools(gated, { config: { ...CONFIG, zecBusSybilRequired: true }, busDb: db });
+		const res = await call(gated, 'gateway_zec_bus_join', { to: 'BTC.BTC', amountZec: 1 });
+		expect(res.error.code).toBe('sybil_required');
+		// listing stays open (read-only, no seat taken)
+		const list = await call(gated, 'gateway_zec_bus_list', {});
+		expect(Array.isArray(list.buses)).toBe(true);
+	});
 });
 
 describe('opt-in gating on buildGatewayMcpServer', () => {
