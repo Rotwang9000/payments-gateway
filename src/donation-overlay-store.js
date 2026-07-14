@@ -27,12 +27,16 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import { hashToken, safeEqualHex } from './notice-board.js';
 
 export const OVERLAY_CONSTANTS = Object.freeze({
-	// Prepaid meter (atomic USDC; 1_000_000 = $1.00). Same day rate as
-	// a private watch — the scanning cost is identical.
-	DAY_RATE_ATOMIC: 20_000,          // $0.02 / day
-	// Grace credit at creation so the overlay is live immediately and
-	// survives until the funding ZEC payment confirms (~10 min + TTL).
-	GRACE_CREDIT_ATOMIC: 30_000,      // $0.03 ≈ 1.5 days
+	// Prepaid meter (atomic USDC; 1_000_000 = $1.00).
+	// Ziving scanning — raised from $0.02 so the product funds itself.
+	DAY_RATE_ATOMIC: 100_000,         // $0.10 / day
+	// Grace credit at creation so the page is live until the funding
+	// ZEC payment confirms (~10 min + TTL).
+	GRACE_CREDIT_ATOMIC: 150_000,     // $0.15 ≈ 1.5 days
+	// Homepage featured placement (sold separately, ZEC memo quote).
+	FEATURE_DAY_RATE_ATOMIC: 5_000_000, // $5.00 / day on the homepage
+	FEATURE_DAYS_MIN: 1,
+	FEATURE_DAYS_MAX: 30,
 	// Hard cap on overlay lifetime per funding cycle (same as watches).
 	MAX_LIFETIME_MS: 365 * 86_400_000,
 	// Donation events older than this are pruned (donor memos should
@@ -49,7 +53,8 @@ export const OVERLAY_CONSTANTS = Object.freeze({
 	// Ziving campaign pages (JustGiving-style public slugs).
 	SLUG_MIN_LEN: 3,
 	SLUG_MAX_LEN: 48,
-	STORY_MAX_LEN: 4000
+	STORY_MAX_LEN: 4000,
+	FEATURED_LIST_MAX: 24
 });
 
 const SCHEMA = `
@@ -81,12 +86,26 @@ CREATE TABLE IF NOT EXISTS donation_overlays (
 	-- optional Ziving campaign page fields (public by design)
 	slug                  TEXT UNIQUE,
 	story                 TEXT,
-	goal_zatoshi          TEXT
+	goal_zatoshi          TEXT,
+	featured_until_ms     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_overlay_active
 	ON donation_overlays(cancelled, credit_atomic, expires_at_ms);
 CREATE INDEX IF NOT EXISTS idx_overlay_slug
 	ON donation_overlays(slug) WHERE slug IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_overlay_featured
+	ON donation_overlays(featured_until_ms) WHERE featured_until_ms IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ziving_feature_quotes (
+	quote_id       TEXT PRIMARY KEY,
+	overlay_id     TEXT NOT NULL,
+	days           INTEGER NOT NULL,
+	usd_cents      INTEGER NOT NULL,
+	settled        INTEGER DEFAULT 0,
+	created_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feature_quote_overlay
+	ON ziving_feature_quotes(overlay_id, settled, usd_cents);
 
 CREATE TABLE IF NOT EXISTS donation_events (
 	id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,8 +150,21 @@ function migrateDonationOverlaySchema(db) {
 	if (!cols.has('slug')) db.exec('ALTER TABLE donation_overlays ADD COLUMN slug TEXT');
 	if (!cols.has('story')) db.exec('ALTER TABLE donation_overlays ADD COLUMN story TEXT');
 	if (!cols.has('goal_zatoshi')) db.exec('ALTER TABLE donation_overlays ADD COLUMN goal_zatoshi TEXT');
+	if (!cols.has('featured_until_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN featured_until_ms INTEGER');
 	db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_overlay_slug_unique ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_slug ON donation_overlays(slug) WHERE slug IS NOT NULL');
+	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_featured ON donation_overlays(featured_until_ms) WHERE featured_until_ms IS NOT NULL');
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS ziving_feature_quotes (
+			quote_id       TEXT PRIMARY KEY,
+			overlay_id     TEXT NOT NULL,
+			days           INTEGER NOT NULL,
+			usd_cents      INTEGER NOT NULL,
+			settled        INTEGER DEFAULT 0,
+			created_at_ms  INTEGER NOT NULL
+		)
+	`);
+	db.exec('CREATE INDEX IF NOT EXISTS idx_feature_quote_overlay ON ziving_feature_quotes(overlay_id, settled, usd_cents)');
 }
 
 /** Unguessable public overlay id — this token IS the OBS URL capability. */
@@ -228,6 +260,65 @@ export function sumConfirmedDonations(db, overlayId) {
 		try { total += BigInt(row.amount_atomic); } catch { /* skip malformed */ }
 	}
 	return { totalZatoshi: total.toString(), donationCount: rows.length };
+}
+
+/** USD cents for N days of homepage featuring. */
+export function featureUsdCentsForDays(days) {
+	const d = Math.floor(Number(days));
+	if (!Number.isInteger(d) || d < OVERLAY_CONSTANTS.FEATURE_DAYS_MIN || d > OVERLAY_CONSTANTS.FEATURE_DAYS_MAX) {
+		throw new TypeError(`feature days must be ${OVERLAY_CONSTANTS.FEATURE_DAYS_MIN}–${OVERLAY_CONSTANTS.FEATURE_DAYS_MAX}`);
+	}
+	return Math.round((d * OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC) / 10_000);
+}
+
+/** Record a pending homepage-feature purchase (settled by the receive-poller). */
+export function createFeatureQuote(db, { quoteId, overlayId, days, usdCents, nowMs = Date.now() }) {
+	if (typeof quoteId !== 'string' || !quoteId) throw new TypeError('createFeatureQuote: quoteId required');
+	if (typeof overlayId !== 'string' || !overlayId) throw new TypeError('createFeatureQuote: overlayId required');
+	const d = Math.floor(Number(days));
+	if (!Number.isInteger(d) || d < OVERLAY_CONSTANTS.FEATURE_DAYS_MIN || d > OVERLAY_CONSTANTS.FEATURE_DAYS_MAX) {
+		throw new TypeError(`feature days must be ${OVERLAY_CONSTANTS.FEATURE_DAYS_MIN}–${OVERLAY_CONSTANTS.FEATURE_DAYS_MAX}`);
+	}
+	if (!Number.isInteger(usdCents) || usdCents <= 0) throw new TypeError('createFeatureQuote: usdCents required');
+	db.prepare(`
+		INSERT INTO ziving_feature_quotes (quote_id, overlay_id, days, usd_cents, settled, created_at_ms)
+		VALUES (?, ?, ?, ?, 0, ?)
+	`).run(quoteId, overlayId, d, usdCents, nowMs);
+	return { quoteId, overlayId, days: d, usdCents };
+}
+
+/**
+ * Settle a homepage-feature purchase: extend featured_until_ms from now
+ * (or from the current featured_until if still live).
+ */
+export function applyFeaturePurchase(db, overlayId, { days, usdCents, nowMs = Date.now() }) {
+	const pending = db.prepare(`
+		SELECT * FROM ziving_feature_quotes
+		WHERE overlay_id = ? AND usd_cents = ? AND settled = 0
+		ORDER BY created_at_ms DESC
+		LIMIT 1
+	`).get(overlayId, usdCents);
+	if (!pending) return { ok: false, reason: 'no_pending_feature' };
+	const row = getOverlay(db, overlayId);
+	if (!row) return { ok: false, reason: 'not_found' };
+	if (row.cancelled === 1) return { ok: false, reason: 'cancelled' };
+	const base = Math.max(nowMs, Number(row.featured_until_ms ?? 0) || 0);
+	const until = base + (pending.days * 86_400_000);
+	db.prepare('UPDATE donation_overlays SET featured_until_ms = ? WHERE id = ?').run(until, overlayId);
+	db.prepare('UPDATE ziving_feature_quotes SET settled = 1 WHERE quote_id = ?').run(pending.quote_id);
+	return { ok: true, featuredUntilMs: until, days: pending.days, row: getOverlay(db, overlayId) };
+}
+
+/** Live homepage-featured campaigns (slug set, not cancelled, still featured). */
+export function listFeaturedCampaigns(db, { nowMs = Date.now(), limit = OVERLAY_CONSTANTS.FEATURED_LIST_MAX } = {}) {
+	const cap = Math.min(Math.max(1, Number(limit) || 1), OVERLAY_CONSTANTS.FEATURED_LIST_MAX);
+	return db.prepare(`
+		SELECT * FROM donation_overlays
+		WHERE slug IS NOT NULL AND cancelled = 0
+		  AND featured_until_ms IS NOT NULL AND featured_until_ms > ?
+		ORDER BY featured_until_ms DESC
+		LIMIT ?
+	`).all(nowMs, cap);
 }
 
 /**

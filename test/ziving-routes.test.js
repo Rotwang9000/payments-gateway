@@ -176,4 +176,52 @@ describe('ziving routes', () => {
 		const res = await app.inject({ method: 'GET', url: '/v1/ziving/page/nobody-here' });
 		expect(res.statusCode).toBe(404);
 	});
+
+	test('GET /v1/ziving includes feature pricing', async () => {
+		const res = await app.inject({ method: 'GET', url: '/v1/ziving' });
+		const body = res.json();
+		expect(Number(body.pricing.scan_rate_per_day_usd)).toBe(0.1);
+		expect(Number(body.pricing.feature_rate_per_day_usd)).toBe(5);
+		expect(body.mcp.note).toContain('ziving');
+	});
+
+	test('feature quote + settle appears on GET /featured', async () => {
+		const { applyFeaturePurchase, featureUsdCentsForDays, getOverlayBySlug: bySlug } = await import('../src/donation-overlay-store.js');
+		const created = await createPage(app);
+		const { ownerToken, slug } = created.json();
+
+		const bad = await app.inject({
+			method: 'POST',
+			url: `/v1/ziving/page/${slug}/feature`,
+			payload: { days: 3 },
+			headers: { 'x-overlay-token': 'wrong' }
+		});
+		expect(bad.statusCode).toBe(403);
+
+		const ok = await app.inject({
+			method: 'POST',
+			url: `/v1/ziving/page/${slug}/feature`,
+			payload: { days: 3 },
+			headers: { 'x-overlay-token': ownerToken }
+		});
+		expect(ok.statusCode).toBe(201);
+		const quote = ok.json();
+		expect(quote.days).toBe(3);
+		expect(quote.product).toBe('homepage_feature');
+		expect(quote.payment.memo).toMatch(/^PGF/u);
+
+		const usdCents = featureUsdCentsForDays(3);
+		expect(usdCents).toBe(1500);
+		const row = bySlug(db, slug);
+		const settled = applyFeaturePurchase(db, row.id, { usdCents, nowMs: NOW });
+		expect(settled.ok).toBe(true);
+		expect(settled.featuredUntilMs).toBe(NOW + 3 * 86_400_000);
+
+		const feat = await app.inject({ method: 'GET', url: '/v1/ziving/featured' });
+		expect(feat.statusCode).toBe(200);
+		const list = feat.json();
+		expect(list.count).toBe(1);
+		expect(list.campaigns[0].slug).toBe(slug);
+		expect(list.campaigns[0].featured).toBe(true);
+	});
 });

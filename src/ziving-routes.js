@@ -6,10 +6,12 @@
 // optional label/story/goal). Scanning is prepaid in ZEC via memo quotes.
 //
 // Surface:
-//   GET  /v1/ziving                         metadata
+//   GET  /v1/ziving                         metadata + pricing (scan + homepage feature)
+//   GET  /v1/ziving/featured                homepage-promoted campaigns
 //   POST /v1/ziving/page                    create campaign (rate-limited)
 //   GET  /v1/ziving/page/:slug              public page data + totals
 //   GET  /v1/ziving/page/:slug/events       donation feed (cursor-paginated)
+//   POST /v1/ziving/page/:slug/feature      owner token → ZEC quote for homepage promo
 //
 // Management (top-up, cancel) reuses /v1/overlay/:id with the owner token.
 
@@ -27,9 +29,13 @@ import {
 	createOverlay,
 	getOverlay,
 	getOverlayBySlug,
+	getOverlayAuthorised,
 	listEventsSince,
 	normaliseCampaignSlug,
-	sumConfirmedDonations
+	sumConfirmedDonations,
+	listFeaturedCampaigns,
+	createFeatureQuote,
+	featureUsdCentsForDays
 } from './donation-overlay-store.js';
 import {
 	OVERLAY_CREATE_PER_IP_PER_MIN,
@@ -69,6 +75,8 @@ export function publicCampaign(row, totals, { nowMs = Date.now(), urls = {} } = 
 	const overlay = publicOverlay(row, { nowMs });
 	const totalZat = BigInt(totals?.totalZatoshi ?? '0');
 	const goalZat = row.goal_zatoshi != null ? BigInt(row.goal_zatoshi) : null;
+	const featuredUntil = row.featured_until_ms != null ? Number(row.featured_until_ms) : null;
+	const featured = featuredUntil != null && featuredUntil > nowMs;
 	return {
 		slug: row.slug ?? null,
 		overlayId: row.id,
@@ -86,6 +94,8 @@ export function publicCampaign(row, totals, { nowMs = Date.now(), urls = {} } = 
 				? Math.min(100, Number((totalZat * 10000n) / goalZat) / 100)
 				: null
 		},
+		featured,
+		featured_until: featured ? new Date(featuredUntil).toISOString() : null,
 		state: overlay.state,
 		active: overlay.active,
 		credit: overlay.credit,
@@ -163,24 +173,48 @@ export function registerZivingRoutes(app, deps) {
 				'1. Create a donation-only shielded wallet in Winbit32 (vault or receive wizard) and export the UFVK + unified address.',
 				'2. POST /v1/ziving/page { slug, label, story?, goalZec?, ufvk, address, amountUsdCents? } — returns your public page URL, ownerToken (once) and a ZEC funding quote.',
 				'3. Share the page; donations appear live on the page and in the OBS overlay feed.',
-				'4. Top up scanning credit with POST /v1/overlay/:id/topup (header x-overlay-token).'
+				'4. Top up scanning with POST /v1/overlay/:id/topup; promote on the homepage with POST /v1/ziving/page/:slug/feature (header x-overlay-token).'
 			],
+			mcp: {
+				note: 'AI agents: use the winbit32_*_ziving_* MCP tools (info, create_page, get_page, featured, feature, topup, cancel) on mcp.winbit32.com.',
+				base: 'https://mcp.winbit32.com/mcp'
+			},
 			winbit32: {
 				createVault: 'https://winbit32.com/#winbit32.exe/createvault.exe',
 				receiveWizard: 'https://winbit32.com/#winbit32.exe/zcashrecv.exe',
 				purse: 'https://winbit32.com/#winbit32.exe/purse.exe'
 			},
 			pricing: {
-				model: 'prepaid credit meter, funded in ZEC (memo-token quote)',
-				rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.DAY_RATE_ATOMIC),
+				model: 'prepaid credit meter + optional homepage feature, both funded in ZEC (memo-token quote)',
+				scan_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.DAY_RATE_ATOMIC),
 				grace_credit_usd: atomicToUsdString(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC),
+				feature_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC),
+				feature_days: { min: OVERLAY_CONSTANTS.FEATURE_DAYS_MIN, max: OVERLAY_CONSTANTS.FEATURE_DAYS_MAX },
 				min_usd: policy.minUsdCents / 100,
-				max_usd: policy.maxUsdCents / 100
+				max_usd: policy.maxUsdCents / 100,
+				suggested_scan_usd: [5, 10, 25]
 			},
-			privacy: 'we store: your UFVK (AES-256-GCM encrypted), your public receive address, optional label/story/goal. Donation events (amount + memo) prune after 30 days. No accounts, email or IPs.',
+			privacy: 'we store: your UFVK (AES-256-GCM encrypted), your public receive address, optional label/story/goal, optional featured-until. Donation events (amount + memo) prune after 30 days. No accounts, email or IPs.',
 			zec_funding_enabled: zecEnabled()
 		};
 		return info;
+	});
+
+	app.get('/v1/ziving/featured', async () => {
+		if (!watchDb) return { campaigns: [], count: 0 };
+		const nowMs = now();
+		const rows = listFeaturedCampaigns(watchDb, { nowMs });
+		const campaigns = rows.map((row) => {
+			const totals = sumConfirmedDonations(watchDb, row.id);
+			return publicCampaign(row, totals, { nowMs, urls: urlsFor(row) });
+		});
+		return {
+			campaigns,
+			count: campaigns.length,
+			pricing: {
+				feature_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC)
+			}
+		};
 	});
 
 	const createRouteOpts = { config: { rateLimit: { max: OVERLAY_CREATE_PER_IP_PER_MIN, timeWindow: '1 minute' } } };
@@ -313,10 +347,78 @@ export function registerZivingRoutes(app, deps) {
 		};
 	});
 
+	app.post('/v1/ziving/page/:slug/feature', async (req, reply) => {
+		if (!ready()) return privateNotConfigured(reply);
+		if (!zecEnabled()) {
+			return reply.code(503).send({ error: { code: 'zec_funding_not_configured', message: 'ZEC funding is not enabled on this server.' } });
+		}
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const token = req.headers['x-overlay-token'] ?? req.body?.ownerToken;
+		const got = getOverlayAuthorised(watchDb, row.id, typeof token === 'string' ? token : '');
+		if (got.error === 'forbidden') return reply.code(403).send({ error: { code: 'forbidden', message: 'owner token mismatch (pass it via the x-overlay-token header)' } });
+		if (got.cancelled === 1) return reply.code(409).send({ error: { code: 'cancelled', message: 'page is cancelled' } });
+
+		let days;
+		try {
+			days = Math.floor(Number(req.body?.days ?? 3));
+			featureUsdCentsForDays(days); // validates bounds
+		} catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const usdCents = featureUsdCentsForDays(days);
+
+		let price;
+		try { price = await priceOracle.getUsdPrice('zcash'); }
+		catch (err) {
+			log.warn({ err: err?.message ?? String(err) }, 'ziving-feature: price oracle unavailable');
+			return reply.code(503).send({ error: { code: 'price_unavailable', message: 'could not fetch a live exchange rate; please retry shortly' } });
+		}
+
+		const { expectedAtomic, memo } = allocateQuoteAmount(watchDb, {
+			chain: 'zcash',
+			amountUsdCents: usdCents,
+			priceUsd: price.usd,
+			spreadBps: policy.spreadBps,
+			memoPrefix: `${memoPrefix}F`
+		});
+		const nowMs = now();
+		const quoteId = randomUUID();
+		const quoteRow = createQuote(watchDb, {
+			id: quoteId,
+			watchId: got.id,
+			watchToken: String(token),
+			chain: 'zcash',
+			recvAddress: recvAddresses.zcash,
+			memo,
+			quotedUsdCents: usdCents,
+			expectedAtomic,
+			usdPriceMilli: Math.round(price.usd * 1000),
+			spreadBps: policy.spreadBps,
+			createdAtMs: nowMs,
+			expiresAtMs: nowMs + policy.quoteTtlSec * 1000
+		});
+		createFeatureQuote(watchDb, { quoteId, overlayId: got.id, days, usdCents, nowMs });
+		log.info({ slug, overlayId: got.id, days, usdCents, quoteId }, 'ziving: homepage feature quote created');
+		return reply.code(201).send({
+			slug,
+			days,
+			product: 'homepage_feature',
+			payment: publicOverlayQuote(quoteRow, { confirmationsRequired }),
+			note: `After ${confirmationsRequired} confirmations your page appears on the ziving.org homepage for ${days} day${days === 1 ? '' : 's'} ($${atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC)}/day).`
+		});
+	});
+
 	function buildZivingStats() {
 		if (!watchDb) return { enabled: false, reason: 'watch DB not opened' };
 		const pages = watchDb.prepare('SELECT COUNT(*) AS n FROM donation_overlays WHERE slug IS NOT NULL').get()?.n ?? 0;
-		return { enabled: ready() && zecEnabled(), campaign_pages: pages };
+		const featured = watchDb.prepare('SELECT COUNT(*) AS n FROM donation_overlays WHERE featured_until_ms > ?').get(now())?.n ?? 0;
+		return { enabled: ready() && zecEnabled(), campaign_pages: pages, featured_pages: featured };
 	}
 
 	return { buildZivingStats };

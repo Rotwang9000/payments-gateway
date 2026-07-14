@@ -9,7 +9,8 @@ import {
 	createOverlay,
 	getOverlay,
 	updateOverlayState,
-	listEventsSince
+	listEventsSince,
+	OVERLAY_CONSTANTS
 } from '../src/donation-overlay-store.js';
 import {
 	runOverlayTick,
@@ -155,7 +156,7 @@ describe('runOverlayTick', () => {
 		});
 		expect(scanned).toBe(0);
 		expect(summary.overlays_out_of_credit).toBe(1);
-		expect(summary.credit_billed_atomic).toBe(60_000); // 3 days at $0.02/day accrued
+		expect(summary.credit_billed_atomic).toBe(300_000); // 3 days at $0.10/day accrued
 		expect(getOverlay(db, id).credit_atomic).toBe(0); // balance floored at zero
 	});
 

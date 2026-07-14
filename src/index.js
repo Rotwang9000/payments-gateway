@@ -12,6 +12,7 @@ export {
 	registerGatewayMcpTools,
 	registerNoticeBoardMcpTools,
 	registerPaidUnlockMcpTools,
+	registerZivingMcpTools,
 	registerMakePaymentMcpTools,
 	registerWalletKitMcpTools,
 	registerUtilityMcpTools,

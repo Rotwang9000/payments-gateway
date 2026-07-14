@@ -30,6 +30,15 @@ import { openBoardDb, listNotices, replyCountsForBoard, statsSnapshot as boardSt
 import { normaliseBoards, sortNotices, buildNoticeSummary, atomicToUsd, BOARD_CONSTANTS } from './notice-board.js';
 import { openUnlockDb, getListing as getUnlockListing, isListingOpen, listPublicListings as listPublicUnlockListings, statsSnapshot as unlockStatsSnapshot } from './paid-unlock-store.js';
 import { publicListing as publicUnlockListing, UNLOCK_CONSTANTS } from './paid-unlock.js';
+import {
+	OVERLAY_CONSTANTS,
+	getOverlayBySlug,
+	listFeaturedCampaigns,
+	sumConfirmedDonations,
+	featureUsdCentsForDays
+} from './donation-overlay-store.js';
+import { publicCampaign } from './ziving-routes.js';
+import { atomicToUsdString } from 'viewkey-watch/private-watch';
 
 import {
 	openWatchDb,
@@ -366,6 +375,11 @@ export function registerGatewayMcpTools(server, opts = {}) {
 
 	registerNoticeBoardMcpTools(server, { ...opts, config, x402Cfg, toolPrefix: prefix });
 
+	// Ziving campaign pages (JustGiving-style). Always registered — reads
+	// degrade gracefully when the watch DB is closed; writes return REST
+	// pointers (or settle via public REST when GATEWAY_PUBLIC_REST_BASE is set).
+	registerZivingMcpTools(server, { ...opts, config, toolPrefix: prefix, watchDb });
+
 	// Paid-unlock tools (info/listing reads + a buy pointer). OPT-IN, matching
 	// the REST plugin: only when the host turned the product on, so embedding
 	// hosts don't gain the tools by surprise.
@@ -655,6 +669,244 @@ export function registerPaidUnlockMcpTools(server, opts = {}) {
 	});
 
 	return { names: ['paid_unlock_info', 'paid_unlock_listing', 'paid_unlock_browse', 'paid_unlock_buy'].map((n) => `${prefix}_${n}`) };
+}
+
+/**
+ * Register the Ziving (private Zcash fundraising) tool family.
+ *
+ * Reads (info / get_page / featured) hit the watch DB when open.
+ * Writes (create_page / feature / topup / cancel) either POST to the
+ * public REST base (so an agent can set up a page end-to-end over MCP)
+ * or return a ready-to-send REST pointer when fetch is unavailable.
+ *
+ * opts:
+ *   - config / toolPrefix / watchDb
+ *   - publicRestBase  e.g. https://mcp.winbit32.com (env GATEWAY_PUBLIC_REST_BASE)
+ *   - fetchImpl       default globalThis.fetch
+ */
+export function registerZivingMcpTools(server, opts = {}) {
+	const config = opts.config ?? gatewayConfig;
+	const prefix = opts.toolPrefix ?? 'gateway';
+	const watchDb = opts.watchDb;
+	const pageBase = (config.zivingPageUrlBase || 'https://ziving.org').replace(/\/$/u, '');
+	const restBase = (opts.publicRestBase
+		?? config.publicRestBase
+		?? process.env.GATEWAY_PUBLIC_REST_BASE
+		?? 'https://mcp.winbit32.com').replace(/\/$/u, '');
+	const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+
+	async function restJson(method, path, { body, headers } = {}) {
+		if (typeof fetchImpl !== 'function') {
+			return { ok: false, pointer: true, method, path, body: body ?? null, headers: headers ?? null };
+		}
+		try {
+			const res = await fetchImpl(`${restBase}${path}`, {
+				method,
+				headers: { 'content-type': 'application/json', ...(headers || {}) },
+				body: body != null ? JSON.stringify(body) : undefined
+			});
+			const json = await res.json().catch(() => ({}));
+			if (!res.ok) {
+				return { ok: false, status: res.status, error: json?.error ?? { code: 'http_error', message: `HTTP ${res.status}` } };
+			}
+			return { ok: true, status: res.status, ...json };
+		} catch (err) {
+			return {
+				ok: false,
+				pointer: true,
+				method,
+				path: `${restBase}${path}`,
+				body: body ?? null,
+				headers: headers ?? null,
+				fetch_error: err?.message ?? String(err)
+			};
+		}
+	}
+
+	server.registerTool(`${prefix}_ziving_info`, {
+		title: 'Ziving — private Zcash fundraising metadata (FREE)',
+		description: 'How Ziving works: JustGiving-style campaign pages on shielded ZEC. Returns scan pricing, homepage-feature pricing, REST + MCP endpoints, and Winbit32 wallet deep links. Free to call.',
+		inputSchema: {}
+	}, async () => asContent({
+		service: 'ziving',
+		site: pageBase,
+		tagline: 'Private Zcash fundraising — like giving, with a z.',
+		pricing: {
+			scan_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.DAY_RATE_ATOMIC),
+			grace_credit_usd: atomicToUsdString(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC),
+			feature_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC),
+			feature_days: { min: OVERLAY_CONSTANTS.FEATURE_DAYS_MIN, max: OVERLAY_CONSTANTS.FEATURE_DAYS_MAX },
+			suggested_scan_usd: [5, 10, 25]
+		},
+		how_to_set_up: [
+			'1. Create a donation-only shielded wallet in Winbit32; export UFVK (uview1…) + unified address (u1…).',
+			`2. Call ${prefix}_ziving_create_page with slug, label, ufvk, address, amountUsdCents — keep the ownerToken.`,
+			'3. Pay the returned ZEC memo quote (scanning credit). Page is live on grace credit immediately.',
+			`4. Optional: ${prefix}_ziving_feature to buy homepage placement ($${atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC)}/day).`,
+			`5. Share ${pageBase}/p/<slug>; manage later with ${prefix}_ziving_topup / ${prefix}_ziving_cancel.`
+		],
+		endpoints: {
+			info: 'GET /v1/ziving',
+			featured: 'GET /v1/ziving/featured',
+			create: 'POST /v1/ziving/page',
+			page: 'GET /v1/ziving/page/{slug}',
+			events: 'GET /v1/ziving/page/{slug}/events',
+			feature: 'POST /v1/ziving/page/{slug}/feature (header x-overlay-token)',
+			topup: 'POST /v1/overlay/{overlayId}/topup (header x-overlay-token)',
+			cancel: 'DELETE /v1/overlay/{overlayId} (header x-overlay-token)'
+		},
+		winbit32: {
+			createVault: 'https://winbit32.com/#winbit32.exe/createvault.exe',
+			receiveWizard: 'https://winbit32.com/#winbit32.exe/zcashrecv.exe',
+			purse: 'https://winbit32.com/#winbit32.exe/purse.exe'
+		},
+		rest_base: restBase
+	}));
+
+	server.registerTool(`${prefix}_ziving_get_page`, {
+		title: 'Ziving — read a campaign page (FREE)',
+		description: 'Return the public view of a Ziving campaign by slug: title, story, raised total, featured status, and page URL. Never returns the UFVK or owner token. Free to call.',
+		inputSchema: {
+			slug: z.string().min(3).max(48).describe('Campaign slug (e.g. alice-marathon).')
+		}
+	}, async ({ slug }) => {
+		if (!watchDb) {
+			return asContent(await restJson('GET', `/v1/ziving/page/${encodeURIComponent(slug)}`));
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return asContent({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const nowMs = Date.now();
+		const totals = sumConfirmedDonations(watchDb, row.id);
+		return asContent(publicCampaign(row, totals, {
+			nowMs,
+			urls: {
+				page: `${pageBase}/p/${encodeURIComponent(row.slug)}`,
+				events: `/v1/ziving/page/${encodeURIComponent(row.slug)}/events`
+			}
+		}));
+	});
+
+	server.registerTool(`${prefix}_ziving_featured`, {
+		title: 'Ziving — list homepage-featured campaigns (FREE)',
+		description: 'List campaigns currently promoted on the ziving.org homepage (paid feature placement). Free to call.',
+		inputSchema: {}
+	}, async () => {
+		if (!watchDb) {
+			return asContent(await restJson('GET', '/v1/ziving/featured'));
+		}
+		const nowMs = Date.now();
+		const rows = listFeaturedCampaigns(watchDb, { nowMs });
+		return asContent({
+			campaigns: rows.map((row) => {
+				const totals = sumConfirmedDonations(watchDb, row.id);
+				return publicCampaign(row, totals, {
+					nowMs,
+					urls: { page: `${pageBase}/p/${encodeURIComponent(row.slug)}` }
+				});
+			}),
+			count: rows.length,
+			pricing: { feature_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC) }
+		});
+	});
+
+	server.registerTool(`${prefix}_ziving_create_page`, {
+		title: 'Ziving — create a fundraising page',
+		description: 'Create a Ziving campaign page. POSTs to the gateway REST API and returns the public URL, one-time ownerToken, and a ZEC funding quote for scanning credit. Recommend a donation-only wallet: the UFVK reveals all incoming amounts and memos.',
+		inputSchema: {
+			slug: z.string().min(3).max(48).describe('URL slug, lowercase letters/digits/hyphens (e.g. alice-marathon).'),
+			label: z.string().min(1).max(60).describe('Public campaign title.'),
+			ufvk: z.string().min(20).describe('Zcash UFVK (uview1…) — read-only view key, encrypted at rest.'),
+			address: z.string().min(20).describe('Shielded unified receive address (u1…) donors pay.'),
+			story: z.string().max(4000).optional().describe('Optional public story text.'),
+			goalZec: z.number().positive().optional().describe('Optional fundraising goal in ZEC.'),
+			amountUsdCents: z.number().int().positive().optional().describe('Prepay scanning in US cents (e.g. 1000 = $10). Default server policy applies if omitted.')
+		}
+	}, async (params) => {
+		const body = {
+			slug: params.slug,
+			label: params.label,
+			ufvk: params.ufvk,
+			address: params.address,
+			story: params.story,
+			goalZec: params.goalZec,
+			amountUsdCents: params.amountUsdCents ?? 1000
+		};
+		const out = await restJson('POST', '/v1/ziving/page', { body });
+		if (out.pointer) {
+			return asContent({
+				...out,
+				note: 'POST this body to the create endpoint (rate-limited). Save ownerToken from the 201 response — shown once.'
+			});
+		}
+		return asContent({
+			...out,
+			reminder: 'Keep ownerToken safe (shown once). Pay the ZEC quote to fund scanning; page is live on grace credit now.'
+		});
+	});
+
+	server.registerTool(`${prefix}_ziving_feature`, {
+		title: 'Ziving — buy homepage promotion',
+		description: `Purchase homepage featured placement for a campaign ($${atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC)}/day, 1–30 days). Returns a ZEC memo quote; after confirmations the page appears on ziving.org. Requires the owner token.`,
+		inputSchema: {
+			slug: z.string().min(3).max(48).describe('Campaign slug.'),
+			ownerToken: z.string().min(1).describe('Owner token from create (x-overlay-token).'),
+			days: z.number().int().min(OVERLAY_CONSTANTS.FEATURE_DAYS_MIN).max(OVERLAY_CONSTANTS.FEATURE_DAYS_MAX).default(3)
+				.describe(`Days of homepage placement ($${atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC)} each).`)
+		}
+	}, async ({ slug, ownerToken, days }) => {
+		let usdCents;
+		try { usdCents = featureUsdCentsForDays(days ?? 3); }
+		catch (err) {
+			return asContent({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const out = await restJson('POST', `/v1/ziving/page/${encodeURIComponent(slug)}/feature`, {
+			body: { days: days ?? 3 },
+			headers: { 'x-overlay-token': ownerToken }
+		});
+		if (out.pointer) {
+			return asContent({ ...out, usd_cents: usdCents, note: 'POST with x-overlay-token header to get the ZEC feature quote.' });
+		}
+		return asContent(out);
+	});
+
+	server.registerTool(`${prefix}_ziving_topup`, {
+		title: 'Ziving — top up scanning credit',
+		description: 'Get a ZEC memo quote to add scanning credit to an existing campaign. Requires owner token + overlay id (from create or get_page).',
+		inputSchema: {
+			overlayId: z.string().min(1).describe('Overlay id (ov_…) from create / get_page.'),
+			ownerToken: z.string().min(1).describe('Owner token.'),
+			amountUsdCents: z.number().int().positive().describe('Credit to buy in US cents (e.g. 1000 = $10).')
+		}
+	}, async ({ overlayId, ownerToken, amountUsdCents }) => {
+		const out = await restJson('POST', `/v1/overlay/${encodeURIComponent(overlayId)}/topup`, {
+			body: { amountUsdCents },
+			headers: { 'x-overlay-token': ownerToken }
+		});
+		return asContent(out.pointer
+			? { ...out, note: 'POST with x-overlay-token to receive the ZEC top-up quote.' }
+			: out);
+	});
+
+	server.registerTool(`${prefix}_ziving_cancel`, {
+		title: 'Ziving — cancel a campaign',
+		description: 'Cancel a Ziving page (stops UFVK scanning). Requires owner token. Irreversible.',
+		inputSchema: {
+			overlayId: z.string().min(1).describe('Overlay id (ov_…).'),
+			ownerToken: z.string().min(1).describe('Owner token.')
+		}
+	}, async ({ overlayId, ownerToken }) => {
+		const out = await restJson('DELETE', `/v1/overlay/${encodeURIComponent(overlayId)}`, {
+			headers: { 'x-overlay-token': ownerToken }
+		});
+		return asContent(out.pointer
+			? { ...out, note: 'DELETE with x-overlay-token to cancel scanning.' }
+			: out);
+	});
+
+	return {
+		names: ['ziving_info', 'ziving_get_page', 'ziving_featured', 'ziving_create_page', 'ziving_feature', 'ziving_topup', 'ziving_cancel']
+			.map((n) => `${prefix}_${n}`)
+	};
 }
 
 /**

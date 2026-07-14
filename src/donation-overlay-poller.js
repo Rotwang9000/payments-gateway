@@ -34,7 +34,8 @@ import {
 	updateEventConfirmations,
 	listUnconfirmedEvents,
 	pruneOverlayData,
-	topupOverlayById
+	topupOverlayById,
+	applyFeaturePurchase
 } from './donation-overlay-store.js';
 
 // Zcash reorg safety margin (blocks) below the last scanned height —
@@ -91,9 +92,17 @@ export function makeOverlayCreditApplier(db) {
 	const CENTS_TO_ATOMIC_USDC = 10_000;
 	return ({ watchId, usdCents }) => {
 		if (!Number.isInteger(usdCents) || usdCents <= 0) return { ok: false, reason: 'invalid_amount' };
+		// Homepage feature quotes settle first (same overlay id, distinct cents).
+		const feat = applyFeaturePurchase(db, watchId, { usdCents });
+		if (feat.ok) {
+			return { ok: true, kind: 'feature', featuredUntilMs: feat.featuredUntilMs, days: feat.days };
+		}
+		if (feat.reason && feat.reason !== 'no_pending_feature') {
+			return { ok: false, reason: feat.reason };
+		}
 		const out = topupOverlayById(db, watchId, { creditAtomic: usdCents * CENTS_TO_ATOMIC_USDC });
 		return out.ok
-			? { ok: true, newBalanceAtomic: out.row.credit_atomic }
+			? { ok: true, kind: 'scan', newBalanceAtomic: out.row.credit_atomic }
 			: { ok: false, reason: out.reason };
 	};
 }

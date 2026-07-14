@@ -18,7 +18,11 @@ import {
 	listEventsSince,
 	listUnconfirmedEvents,
 	pruneOverlayData,
-	overlayStatsSnapshot
+	overlayStatsSnapshot,
+	featureUsdCentsForDays,
+	createFeatureQuote,
+	applyFeaturePurchase,
+	listFeaturedCampaigns
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -75,7 +79,7 @@ describe('overlay lifecycle', () => {
 		const out = topupOverlayById(db, created.id, { creditAtomic: 2_000_000, nowMs: NOW });
 		expect(out.ok).toBe(true);
 		expect(out.row.credit_atomic).toBe(2_000_000);
-		expect(out.row.expires_at_ms).toBeGreaterThan(NOW + 80 * 86_400_000); // $2 / $0.02 = 100 days
+		expect(out.row.expires_at_ms).toBeGreaterThan(NOW + 15 * 86_400_000); // $2 / $0.10 = 20 days
 		expect(listActiveOverlays(db, { nowMs: NOW })).toHaveLength(1);
 	});
 
@@ -162,5 +166,25 @@ describe('donation events', () => {
 		expect(stats.overlays_active).toBe(1);
 		expect(stats.events_total).toBe(2);
 		expect(stats.events_visible).toBe(1);
+	});
+});
+
+describe('homepage feature quotes', () => {
+	let db;
+	beforeEach(() => { db = openDb(); });
+
+	test('feature quotes settle via applyFeaturePurchase and listFeaturedCampaigns', () => {
+		const created = makeOverlay(db, { slug: 'promo-run', label: 'Promo' });
+		const days = 2;
+		const usdCents = featureUsdCentsForDays(days);
+		expect(usdCents).toBe(1000);
+		createFeatureQuote(db, { quoteId: 'q-feat-1', overlayId: created.id, days, usdCents, nowMs: NOW });
+		const out = applyFeaturePurchase(db, created.id, { days, usdCents, nowMs: NOW });
+		expect(out.ok).toBe(true);
+		expect(out.featuredUntilMs).toBe(NOW + 2 * 86_400_000);
+		const list = listFeaturedCampaigns(db, { nowMs: NOW + 1000 });
+		expect(list).toHaveLength(1);
+		expect(list[0].slug).toBe('promo-run');
+		expect(listFeaturedCampaigns(db, { nowMs: NOW + 3 * 86_400_000 })).toHaveLength(0);
 	});
 });
