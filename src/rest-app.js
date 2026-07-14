@@ -31,7 +31,13 @@ export async function buildGatewayApp(options = {}) {
 	await app.register(cors, {
 		origin: true,
 		methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-		allowedHeaders: ['content-type', 'authorization', 'x-payment', 'x-watch-token'],
+		allowedHeaders: [
+			'content-type',
+			'authorization',
+			'x-payment',
+			'x-watch-token',
+			'x-overlay-token'
+		],
 		exposedHeaders: ['payment-required', 'x-payment-response', 'x-ai-cost-usd', 'x-ai-credits-remaining-usd', 'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset'],
 		maxAge: 86400
 	});
