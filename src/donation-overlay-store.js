@@ -91,10 +91,8 @@ CREATE TABLE IF NOT EXISTS donation_overlays (
 );
 CREATE INDEX IF NOT EXISTS idx_overlay_active
 	ON donation_overlays(cancelled, credit_atomic, expires_at_ms);
-CREATE INDEX IF NOT EXISTS idx_overlay_slug
-	ON donation_overlays(slug) WHERE slug IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_overlay_featured
-	ON donation_overlays(featured_until_ms) WHERE featured_until_ms IS NOT NULL;
+-- slug / featured indexes are created in migrateDonationOverlaySchema
+-- after ALTER TABLE adds those columns on existing DBs.
 
 CREATE TABLE IF NOT EXISTS ziving_feature_quotes (
 	quote_id       TEXT PRIMARY KEY,
