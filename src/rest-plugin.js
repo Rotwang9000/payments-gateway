@@ -47,6 +47,7 @@ import {
 import {
 	parseMasterKey,
 	encryptViewKey,
+	decryptViewKey,
 	generateWebhookSecret
 } from 'viewkey-watch/private-watch-crypto';
 import {
@@ -704,6 +705,7 @@ export function registerGatewayRoutes(app, opts = {}) {
 		policy: cryptoTopupPolicy,
 		memoPrefix: opts.memoPrefix ?? config.memoPrefix,
 		encryptViewKey: watchMasterKey ? (ufvk) => encryptViewKey(ufvk, watchMasterKey) : null,
+		decryptViewKey: watchMasterKey ? (ct) => decryptViewKey(ct, watchMasterKey) : null,
 		nfptHealth: () => safeHealth(nfptClient),
 		zivingPageUrlBase: opts.zivingPageUrlBase ?? config.zivingPageUrlBase ?? '',
 		overlayPageUrlBase: opts.overlayPageUrlBase ?? config.overlayPageUrlBase ?? '',

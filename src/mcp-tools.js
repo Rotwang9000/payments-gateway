@@ -752,6 +752,7 @@ export function registerZivingMcpTools(server, opts = {}) {
 			page: 'GET /v1/ziving/page/{slug}',
 			events: 'GET /v1/ziving/page/{slug}/events',
 			feature: 'POST /v1/ziving/page/{slug}/feature (header x-overlay-token)',
+			recover: 'POST /v1/ziving/page/{slug}/recover { ufvk } → new ownerToken',
 			topup: 'POST /v1/overlay/{overlayId}/topup (header x-overlay-token)',
 			cancel: 'DELETE /v1/overlay/{overlayId} (header x-overlay-token)'
 		},
@@ -903,8 +904,24 @@ export function registerZivingMcpTools(server, opts = {}) {
 			: out);
 	});
 
+	server.registerTool(`${prefix}_ziving_recover`, {
+		title: 'Ziving — recover owner token with UFVK',
+		description: 'Re-present the campaign UFVK (uview1…) to prove ownership and receive a fresh ownerToken. Previous token is revoked. Use when the token was lost; prefer saving the token from create when possible.',
+		inputSchema: {
+			slug: z.string().min(3).max(48).describe('Campaign slug.'),
+			ufvk: z.string().min(20).describe('Same Zcash UFVK (uview1…) used when the page was created.')
+		}
+	}, async ({ slug, ufvk }) => {
+		const out = await restJson('POST', `/v1/ziving/page/${encodeURIComponent(slug)}/recover`, {
+			body: { ufvk }
+		});
+		return asContent(out.pointer
+			? { ...out, note: 'POST { ufvk } to recover a new ownerToken.' }
+			: out);
+	});
+
 	return {
-		names: ['ziving_info', 'ziving_get_page', 'ziving_featured', 'ziving_create_page', 'ziving_feature', 'ziving_topup', 'ziving_cancel']
+		names: ['ziving_info', 'ziving_get_page', 'ziving_featured', 'ziving_create_page', 'ziving_feature', 'ziving_topup', 'ziving_cancel', 'ziving_recover']
 			.map((n) => `${prefix}_${n}`)
 	};
 }

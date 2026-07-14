@@ -12,6 +12,7 @@
 //   GET  /v1/ziving/page/:slug              public page data + totals
 //   GET  /v1/ziving/page/:slug/events       donation feed (cursor-paginated)
 //   POST /v1/ziving/page/:slug/feature      owner token → ZEC quote for homepage promo
+//   POST /v1/ziving/page/:slug/recover      re-present UFVK → new ownerToken (wallet unlock)
 //
 // Management (top-up, cancel) reuses /v1/overlay/:id with the owner token.
 
@@ -35,7 +36,8 @@ import {
 	sumConfirmedDonations,
 	listFeaturedCampaigns,
 	createFeatureQuote,
-	featureUsdCentsForDays
+	featureUsdCentsForDays,
+	recoverOverlayOwnerByUfvk
 } from './donation-overlay-store.js';
 import {
 	OVERLAY_CREATE_PER_IP_PER_MIN,
@@ -46,6 +48,8 @@ import {
 import { OVERLAY_CONFIRMATIONS_DEFAULT } from './donation-overlay-poller.js';
 
 const ZATOSHI_PER_ZEC = 100_000_000;
+/** Recover is cheaper than create but still UFVK-sensitive — keep tight. */
+const OVERLAY_RECOVER_PER_IP_PER_MIN = 10;
 
 /**
  * Validate POST /v1/ziving/page. Extends overlay credentials with a
@@ -130,6 +134,7 @@ export function registerZivingRoutes(app, deps) {
 		policy,
 		memoPrefix = 'PG',
 		encryptViewKey,
+		decryptViewKey,
 		nfptHealth,
 		zivingPageUrlBase = '',
 		overlayPageUrlBase = '',
@@ -150,6 +155,7 @@ export function registerZivingRoutes(app, deps) {
 
 	const zecEnabled = () => typeof recvAddresses.zcash === 'string' && recvAddresses.zcash.length > 0;
 	const ready = () => Boolean(privateWatchReady() && watchDb && priceOracle && typeof encryptViewKey === 'function');
+	const recoverReady = () => Boolean(privateWatchReady() && watchDb && typeof decryptViewKey === 'function');
 	const confirmationsRequired = policy.confirmations?.zcash ?? 8;
 
 	function urlsFor(row) {
@@ -173,10 +179,10 @@ export function registerZivingRoutes(app, deps) {
 				'1. Create a donation-only shielded wallet in Winbit32 (vault or receive wizard) and export the UFVK + unified address.',
 				'2. POST /v1/ziving/page { slug, label, story?, goalZec?, ufvk, address, amountUsdCents? } — returns your public page URL, ownerToken (once) and a ZEC funding quote.',
 				'3. Share the page; donations appear live on the page and in the OBS overlay feed.',
-				'4. Top up scanning with POST /v1/overlay/:id/topup; promote on the homepage with POST /v1/ziving/page/:slug/feature (header x-overlay-token).'
+				'4. Top up scanning with POST /v1/overlay/:id/topup; promote on the homepage with POST /v1/ziving/page/:slug/feature (header x-overlay-token). Lost token? POST /v1/ziving/page/:slug/recover with the same UFVK.'
 			],
 			mcp: {
-				note: 'AI agents: use the winbit32_*_ziving_* MCP tools (info, create_page, get_page, featured, feature, topup, cancel) on mcp.winbit32.com.',
+				note: 'AI agents: use the winbit32_*_ziving_* MCP tools (info, create_page, get_page, featured, feature, topup, cancel, recover) on mcp.winbit32.com.',
 				base: 'https://mcp.winbit32.com/mcp'
 			},
 			winbit32: {
@@ -322,6 +328,38 @@ export function registerZivingRoutes(app, deps) {
 		const nowMs = now();
 		const totals = sumConfirmedDonations(watchDb, row.id);
 		return publicCampaign(row, totals, { nowMs, urls: urlsFor(row) });
+	});
+
+	// Prove ownership with the same UFVK used at create → issue a fresh ownerToken.
+	const recoverOpts = { config: { rateLimit: { max: OVERLAY_RECOVER_PER_IP_PER_MIN, timeWindow: '1 minute' } } };
+	app.post('/v1/ziving/page/:slug/recover', recoverOpts, async (req, reply) => {
+		if (!recoverReady()) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		// Same response for missing vs wrong UFVK to avoid slug enumeration via timing of decrypt.
+		if (!row) {
+			return reply.code(403).send({ error: { code: 'forbidden', message: 'UFVK does not match this page (or the page was not found)' } });
+		}
+		const ufvk = typeof req.body?.ufvk === 'string' ? req.body.ufvk.trim() : '';
+		const out = recoverOverlayOwnerByUfvk(watchDb, row.id, ufvk, decryptViewKey);
+		if (!out.ok) {
+			const code = out.reason === 'cancelled' ? 409 : 403;
+			const message = out.reason === 'cancelled'
+				? 'page is cancelled'
+				: 'UFVK does not match this page (or the page was not found)';
+			return reply.code(code).send({ error: { code: out.reason === 'cancelled' ? 'cancelled' : 'forbidden', message } });
+		}
+		log.info({ slug, overlayId: out.id }, 'ziving: owner token recovered via UFVK');
+		return {
+			slug,
+			overlayId: out.id,
+			ownerToken: out.ownerToken,
+			note: 'New ownerToken issued — previous token is revoked. Save this; manage with x-overlay-token.'
+		};
 	});
 
 	app.get('/v1/ziving/page/:slug/events', async (req, reply) => {

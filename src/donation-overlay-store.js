@@ -22,9 +22,16 @@
 // the overlay's credit meter) settle in one place. Every function
 // takes the `db` handle first; tests use `:memory:`.
 
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 
 import { hashToken, safeEqualHex } from './notice-board.js';
+
+/** Constant-time string compare via SHA-256 digests (length-independent). */
+export function safeEqualUtf8(a, b) {
+	const ha = createHash('sha256').update(String(a ?? ''), 'utf8').digest();
+	const hb = createHash('sha256').update(String(b ?? ''), 'utf8').digest();
+	return timingSafeEqual(ha, hb);
+}
 
 export const OVERLAY_CONSTANTS = Object.freeze({
 	// Prepaid meter (atomic USDC; 1_000_000 = $1.00).
@@ -330,6 +337,44 @@ export function getOverlayAuthorised(db, id, ownerToken) {
 		return { error: 'forbidden' };
 	}
 	return row;
+}
+
+/**
+ * Rotate the owner bearer token. Returns the new plaintext token (shown once).
+ * Caller must already have proven ownership (token or UFVK match).
+ */
+export function rotateOverlayOwnerToken(db, id) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	const ownerToken = genOverlayOwnerToken();
+	db.prepare('UPDATE donation_overlays SET owner_token_hash = ? WHERE id = ?')
+		.run(hashToken(ownerToken), id);
+	return { ok: true, ownerToken, id };
+}
+
+/**
+ * Prove ownership by re-presenting the UFVK used at create time.
+ * `decryptViewKey(ciphertext)` must return the plaintext UFVK.
+ * On match, rotates the owner token and returns it once.
+ */
+export function recoverOverlayOwnerByUfvk(db, id, presentedUfvk, decryptViewKey) {
+	if (typeof decryptViewKey !== 'function') {
+		throw new TypeError('recoverOverlayOwnerByUfvk: decryptViewKey required');
+	}
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	if (row.cancelled === 1) return { ok: false, reason: 'cancelled' };
+	const ufvk = typeof presentedUfvk === 'string' ? presentedUfvk.trim() : '';
+	if (!ufvk.startsWith('uview')) return { ok: false, reason: 'invalid_ufvk' };
+	let stored;
+	try { stored = decryptViewKey(row.ufvk_ct); }
+	catch {
+		return { ok: false, reason: 'decrypt_failed' };
+	}
+	if (!safeEqualUtf8(stored, ufvk)) return { ok: false, reason: 'forbidden' };
+	const rotated = rotateOverlayOwnerToken(db, id);
+	if (!rotated.ok) return rotated;
+	return { ok: true, ownerToken: rotated.ownerToken, id: row.id, slug: row.slug ?? null };
 }
 
 /** Cancel an overlay (owner token). Returns { ok } | { ok:false, reason }. */

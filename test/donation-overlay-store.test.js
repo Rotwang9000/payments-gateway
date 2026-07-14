@@ -22,7 +22,8 @@ import {
 	featureUsdCentsForDays,
 	createFeatureQuote,
 	applyFeaturePurchase,
-	listFeaturedCampaigns
+	listFeaturedCampaigns,
+	recoverOverlayOwnerByUfvk
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -88,6 +89,24 @@ describe('overlay lifecycle', () => {
 		const created = makeOverlay(db);
 		cancelOverlay(db, created.id, created.ownerToken);
 		expect(topupOverlayById(db, created.id, { creditAtomic: 1 }).reason).toBe('cancelled');
+	});
+
+	test('UFVK recover rotates owner token and rejects wrong key', () => {
+		const created = makeOverlay(db, { slug: 'alice', ufvkCiphertext: 'ct:alice-ufvk' });
+		const decrypt = (ct) => {
+			expect(ct).toBe('ct:alice-ufvk');
+			return 'uview1alice-secret-key';
+		};
+		const bad = recoverOverlayOwnerByUfvk(db, created.id, 'uview1wrong', decrypt);
+		expect(bad.ok).toBe(false);
+		expect(bad.reason).toBe('forbidden');
+		expect(getOverlayAuthorised(db, created.id, created.ownerToken).id).toBe(created.id);
+
+		const good = recoverOverlayOwnerByUfvk(db, created.id, 'uview1alice-secret-key', decrypt);
+		expect(good.ok).toBe(true);
+		expect(good.ownerToken).not.toBe(created.ownerToken);
+		expect(getOverlayAuthorised(db, created.id, created.ownerToken).error).toBe('forbidden');
+		expect(getOverlayAuthorised(db, created.id, good.ownerToken).id).toBe(created.id);
 	});
 });
 

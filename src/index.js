@@ -164,7 +164,9 @@ export {
 	recordDonationEvent,
 	listEventsSince,
 	pruneOverlayData,
-	overlayStatsSnapshot
+	overlayStatsSnapshot,
+	rotateOverlayOwnerToken,
+	recoverOverlayOwnerByUfvk
 } from './donation-overlay-store.js';
 
 export {
