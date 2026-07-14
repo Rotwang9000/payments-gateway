@@ -150,6 +150,44 @@ export { registerPaidUnlockRoutes } from './paid-unlock-routes.js';
 
 export { runUnlockRecvReconcile, paymentCoversOrder } from './paid-unlock-poller.js';
 
+// ── Donation overlay: streamer ZEC donation alerts from a UFVK ──
+export {
+	OVERLAY_CONSTANTS,
+	ensureDonationOverlaySchema,
+	createOverlay,
+	getOverlay,
+	getOverlayAuthorised,
+	cancelOverlay,
+	listActiveOverlays,
+	topupOverlayById,
+	recordDonationEvent,
+	listEventsSince,
+	pruneOverlayData,
+	overlayStatsSnapshot
+} from './donation-overlay-store.js';
+
+export {
+	runOverlayTick,
+	ingestScanResult,
+	scanBoundsForOverlay,
+	makeOverlayScanner,
+	makeOverlayCreditApplier,
+	OVERLAY_CONFIRMATIONS_DEFAULT
+} from './donation-overlay-poller.js';
+
+export {
+	registerDonationOverlayRoutes,
+	validateOverlayCreateRequest,
+	publicOverlay,
+	publicOverlayQuote
+} from './donation-overlay-routes.js';
+
+export {
+	registerZivingRoutes,
+	validateZivingPageRequest,
+	publicCampaign
+} from './ziving-routes.js';
+
 export {
 	monRpc,
 	zecRpc,

@@ -20,8 +20,15 @@ import { openWatchDb } from 'viewkey-watch/private-watch-store';
 import { ensureCryptoTopupSchema } from 'viewkey-watch/crypto-topup-store';
 import { createNfptClient, scanReceiving } from 'viewkey-watch/private-watch-nfpt';
 import { runCryptoRecvTick, makeWatchCreditApplier } from 'viewkey-watch/crypto-recv-poller';
+import { parseMasterKey, decryptViewKey } from 'viewkey-watch/private-watch-crypto';
 import { openUnlockDb } from '../src/paid-unlock-store.js';
 import { runUnlockRecvReconcile } from '../src/paid-unlock-poller.js';
+import { ensureDonationOverlaySchema } from '../src/donation-overlay-store.js';
+import {
+	runOverlayTick,
+	makeOverlayScanner,
+	makeOverlayCreditApplier
+} from '../src/donation-overlay-poller.js';
 
 // NU6 activation height — a safe default Zcash birthday so an unconfigured
 // birthday never triggers a multi-hour autoDetect walk.
@@ -87,6 +94,7 @@ async function main() {
 	}
 	const db = openWatchDb(config.privateWatchDbPath);
 	ensureCryptoTopupSchema(db);
+	ensureDonationOverlaySchema(db);
 	const nfptClient = createNfptClient({
 		baseUrl: config.nfptBaseUrl,
 		apiKey: config.nfptApiKey,
@@ -104,12 +112,22 @@ async function main() {
 		monero: config.cryptoTopupXmrConfirmations,
 		zcash: config.cryptoTopupZecConfirmations
 	};
+	// Credit applier: watches first, then donation overlays (their
+	// funding quotes share crypto_topup_quotes with the overlay id in
+	// the watch_id column).
+	const watchApplier = makeWatchCreditApplier(db);
+	const overlayApplier = makeOverlayCreditApplier(db);
+	const applyCredit = (args) => {
+		const res = watchApplier(args);
+		if (res.ok || res.reason !== 'not_found') return res;
+		return overlayApplier(args);
+	};
 	try {
 		const summary = await runCryptoRecvTick({
 			db,
 			chains,
 			scan,
-			applyCredit: makeWatchCreditApplier(db),
+			applyCredit,
 			confirmations,
 			logger
 		});
@@ -133,6 +151,27 @@ async function main() {
 				}
 				finally { try { unlockDb.close(); } catch { /* ignore */ } }
 			}
+		}
+		// Donation overlays: scan streamer wallets for new incoming notes.
+		// Needs the master key to decrypt stored UFVKs.
+		if (config.privateWatchEncryptionKey) {
+			try {
+				const masterKey = parseMasterKey(config.privateWatchEncryptionKey);
+				const overlaySummary = await runOverlayTick({
+					db,
+					decryptViewKey: (ct) => decryptViewKey(ct, masterKey),
+					scanWallet: makeOverlayScanner(nfptClient, { pollIntervalMs: NFPT_POLL_INTERVAL_MS }),
+					maxOverlaysPerTick: config.overlayMaxPerTick,
+					logger
+				});
+				logJson('info', { event: 'overlay_tick', ...overlaySummary });
+			}
+			catch (err) {
+				logJson('error', { event: 'overlay_tick_failed', message: err?.message ?? String(err), stack: err?.stack });
+			}
+		}
+		else {
+			logJson('info', { event: 'overlay_tick_skipped', reason: 'PRIVATE_WATCH_ENCRYPTION_KEY not set' });
 		}
 		process.exit(0);
 	}

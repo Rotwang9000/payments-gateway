@@ -108,6 +108,8 @@ One source of truth, assembled from already-public packages:
 | Wallet view-key tools (`*_zec_scan_*`, `*_zec_utxos`, `*_zec_broadcast`, `*_xmr_scan_*`) | ✅ |
 | Utility tools: `phrase_validate/complete/generate`, `shamir_split/combine` — local + offline | ✅ |
 | **Paid unlock** ("paid private file"): seal a secret, sell it for ZEC/XMR (view-key, auto-confirmed) or USDC (x402); opt-in public shop feed; browser-encrypt demo — opt-in | ✅ |
+| **Donation overlay**: LiveZEC-style OBS alerts from a streamer's UFVK (no custody, ZEC prepaid meter) | ✅ |
+| **Ziving** ([ziving.org](https://ziving.org)): JustGiving-style Zcash fundraising pages on the same UFVK scanner | ✅ |
 | Platform-blind paid-file delivery over **Nym** (key + ciphertext browser-to-browser) | 🛣️ roadmap |
 | Direct phrase/key signing mode; outbound USDC / XMR | 🛣️ roadmap |
 
@@ -250,6 +252,22 @@ gateway master key. Sellers can opt a listing into a public **shop feed**
 (`GET /v1/unlock/listings`) or keep it link-only (default). Full trust model,
 API surface, the native auto-confirm reconciler and the WebCrypto browser demo:
 [`docs/PAID_UNLOCK.md`](docs/PAID_UNLOCK.md).
+
+## Donation overlay + Ziving
+
+LiveZEC-style **on-stream Zcash donation alerts** and JustGiving-style
+**campaign pages** ([ziving.org](https://ziving.org)), built on the same UFVK
+scanner as Private Watch:
+
+1. `POST /v1/overlay` or `POST /v1/ziving/page` with a read-only UFVK + receive
+   address → unguessable overlay id (OBS URL), one-shot owner token, and a ZEC
+   funding quote for the prepaid scanning meter (~$0.02/day).
+2. Campaign pages: `GET /v1/ziving/page/:slug` + `/events`; site at
+   `https://ziving.org/p/<slug>` with manage UI at `/manage.html`.
+3. OBS: `donation-overlay.html` / `ziving.org/overlay.html?slug=…`.
+
+UFVKs are AES-256-GCM encrypted at rest; no accounts. Recommend a
+donation-only wallet. Set `ZIVING_PAGE_URL_BASE` and `OVERLAY_PAGE_URL_BASE`.
 
 ## Deployments
 

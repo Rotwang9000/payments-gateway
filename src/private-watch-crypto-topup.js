@@ -80,6 +80,27 @@ export function generateMemo(prefix = DEFAULT_MEMO_PREFIX) {
 	return `${prefix}-${randomBytes(4).toString('hex')}`;
 }
 
+/**
+ * Allocate the payable amount + memo for a new quote: Monero gets a
+ * unique invoice-tagged amount (collision-checked against open quotes),
+ * Zcash gets an attribution memo. Returns { expectedAtomic, memo }.
+ * Throws Error('quote_collision') if a unique Monero amount could not
+ * be found — the caller maps that to a 503.
+ */
+export function allocateQuoteAmount(watchDb, { chain, amountUsdCents, priceUsd, spreadBps, memoPrefix = DEFAULT_MEMO_PREFIX }) {
+	let expectedAtomic = usdCentsToCoinAtomic(amountUsdCents, priceUsd, chain, spreadBps);
+	if (chain !== 'monero') {
+		return { expectedAtomic, memo: generateMemo(memoPrefix) };
+	}
+	for (let i = 0; i < 8; i += 1) {
+		const candidate = withMoneroTag(expectedAtomic);
+		if (!hasOpenQuoteWithAmount(watchDb, 'monero', candidate)) {
+			return { expectedAtomic: candidate, memo: null };
+		}
+	}
+	throw new Error('quote_collision');
+}
+
 /** "$12.34" from integer US cents. */
 export function formatUsdCents(cents) {
 	return `$${(Number(cents) / 100).toFixed(2)}`;
@@ -189,20 +210,21 @@ export function registerCryptoTopupRoutes(app, deps) {
 			return reply.code(503).send({ error: { code: 'price_unavailable', message: 'could not fetch a live exchange rate; please retry shortly' } });
 		}
 
-		let expectedAtomic = usdCentsToCoinAtomic(body.amountUsdCents, price.usd, body.chain, policy.spreadBps);
-		let memo = null;
-		if (body.chain === 'monero') {
-			let allocated = false;
-			for (let i = 0; i < 8; i += 1) {
-				const candidate = withMoneroTag(expectedAtomic);
-				if (!hasOpenQuoteWithAmount(watchDb, 'monero', candidate)) { expectedAtomic = candidate; allocated = true; break; }
-			}
-			if (!allocated) {
+		let expectedAtomic;
+		let memo;
+		try {
+			({ expectedAtomic, memo } = allocateQuoteAmount(watchDb, {
+				chain: body.chain,
+				amountUsdCents: body.amountUsdCents,
+				priceUsd: price.usd,
+				spreadBps: policy.spreadBps,
+				memoPrefix
+			}));
+		} catch (err) {
+			if (err?.message === 'quote_collision') {
 				return reply.code(503).send({ error: { code: 'quote_collision', message: 'could not allocate a unique invoice amount; please retry' } });
 			}
-		}
-		else {
-			memo = generateMemo(memoPrefix);
+			throw err;
 		}
 
 		const nowMs = now();

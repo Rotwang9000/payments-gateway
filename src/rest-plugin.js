@@ -28,6 +28,8 @@ import { openBoardDb } from './notice-board-store.js';
 import { registerNoticeBoardRoutes } from './notice-board-routes.js';
 import { openUnlockDb } from './paid-unlock-store.js';
 import { registerPaidUnlockRoutes } from './paid-unlock-routes.js';
+import { registerDonationOverlayRoutes } from './donation-overlay-routes.js';
+import { registerZivingRoutes } from './ziving-routes.js';
 import { registerAiRoutes, resolveAiConfig } from './ai-credits.js';
 import { openAiDb } from './ai-session-store.js';
 import { registerChatRoutes, resolveChatConfig } from './chat-routes.js';
@@ -678,6 +680,39 @@ export function registerGatewayRoutes(app, opts = {}) {
 		}
 	}
 
+	// Donation overlay — streamer ZEC alerts from a UFVK (OBS browser source).
+	const donationOverlay = registerDonationOverlayRoutes(app, {
+		watchDb,
+		priceOracle: cryptoPriceOracle,
+		recvAddresses: cryptoRecvAddresses,
+		policy: cryptoTopupPolicy,
+		memoPrefix: opts.memoPrefix ?? config.memoPrefix,
+		encryptViewKey: watchMasterKey ? (ufvk) => encryptViewKey(ufvk, watchMasterKey) : null,
+		nfptHealth: () => safeHealth(nfptClient),
+		overlayPageUrlBase: opts.overlayPageUrlBase ?? config.overlayPageUrlBase ?? '',
+		privateWatchReady,
+		privateNotConfigured,
+		log: app.log,
+		now: opts.now
+	});
+
+	// Ziving — JustGiving-style campaign pages (extends donation overlay).
+	const ziving = registerZivingRoutes(app, {
+		watchDb,
+		priceOracle: cryptoPriceOracle,
+		recvAddresses: cryptoRecvAddresses,
+		policy: cryptoTopupPolicy,
+		memoPrefix: opts.memoPrefix ?? config.memoPrefix,
+		encryptViewKey: watchMasterKey ? (ufvk) => encryptViewKey(ufvk, watchMasterKey) : null,
+		nfptHealth: () => safeHealth(nfptClient),
+		zivingPageUrlBase: opts.zivingPageUrlBase ?? config.zivingPageUrlBase ?? '',
+		overlayPageUrlBase: opts.overlayPageUrlBase ?? config.overlayPageUrlBase ?? '',
+		privateWatchReady,
+		privateNotConfigured,
+		log: app.log,
+		now: opts.now
+	});
+
 	// ── x402 payer relay (spend prepaid credit at ANY x402 endpoint) ──
 	// Off unless the host injects a funded payer (opts.x402Payer) AND the
 	// watch DB (the prepaid balance ledger) is open. Brand-neutral: the
@@ -779,6 +814,8 @@ export function registerGatewayRoutes(app, opts = {}) {
 		buildNoticeBoardStats: noticeBoard.buildNoticeBoardStats,
 		unlockDb: unlock?.unlockDb ?? null,
 		buildUnlockStats: unlock?.buildUnlockStats ?? null,
+		buildOverlayStats: donationOverlay.buildOverlayStats,
+		buildZivingStats: ziving.buildZivingStats,
 		aiDb,
 		aiReady: aiHandle.aiReady,
 		chatReady: chatHandle.chatReady,

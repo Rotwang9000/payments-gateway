@@ -292,6 +292,10 @@ export function buildConfig(env = process.env) {
 		cryptoTopupXmrConfirmations: asInt(env, 'CRYPTO_TOPUP_XMR_CONFIRMATIONS', 10),
 		cryptoTopupZecConfirmations: asInt(env, 'CRYPTO_TOPUP_ZEC_CONFIRMATIONS', 8),
 		cryptoRecvPollIntervalSec: asInt(env, 'CRYPTO_RECV_POLL_INTERVAL_SEC', 60),
+		// Donation overlay + Ziving (ziving.org campaign pages)
+		overlayPageUrlBase: asString(env, 'OVERLAY_PAGE_URL_BASE', ''),
+		overlayMaxPerTick: asInt(env, 'OVERLAY_MAX_PER_TICK', 4),
+		zivingPageUrlBase: asString(env, 'ZIVING_PAGE_URL_BASE', ''),
 		cryptoPriceUrl: asString(env, 'CRYPTO_PRICE_URL', 'https://api.coingecko.com/api/v3/simple/price'),
 		cryptoPriceCacheTtlMs: asInt(env, 'CRYPTO_PRICE_CACHE_TTL_MS', 60_000),
 		cryptoPriceTimeoutMs: asInt(env, 'CRYPTO_PRICE_TIMEOUT_MS', 5_000),

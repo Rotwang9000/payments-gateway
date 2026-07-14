@@ -1,0 +1,323 @@
+// Ziving — JustGiving-style Zcash fundraising pages.
+//
+// Built on the donation-overlay UFVK scanner: fundraisers register a
+// read-only view key + receive address, pick a public slug, and donors pay
+// them directly. We store as little as possible (encrypted UFVK, address,
+// optional label/story/goal). Scanning is prepaid in ZEC via memo quotes.
+//
+// Surface:
+//   GET  /v1/ziving                         metadata
+//   POST /v1/ziving/page                    create campaign (rate-limited)
+//   GET  /v1/ziving/page/:slug              public page data + totals
+//   GET  /v1/ziving/page/:slug/events       donation feed (cursor-paginated)
+//
+// Management (top-up, cancel) reuses /v1/overlay/:id with the owner token.
+
+import { randomUUID } from 'node:crypto';
+
+import { atomicToUsdString } from 'viewkey-watch/private-watch';
+import { createQuote } from 'viewkey-watch/crypto-topup-store';
+import { formatCoinAmount } from 'viewkey-watch/crypto-price';
+
+import { sanitiseText } from './notice-board.js';
+import { allocateQuoteAmount, formatUsdCents } from './private-watch-crypto-topup.js';
+import {
+	OVERLAY_CONSTANTS,
+	ensureDonationOverlaySchema,
+	createOverlay,
+	getOverlay,
+	getOverlayBySlug,
+	listEventsSince,
+	normaliseCampaignSlug,
+	sumConfirmedDonations
+} from './donation-overlay-store.js';
+import {
+	OVERLAY_CREATE_PER_IP_PER_MIN,
+	publicOverlay,
+	publicOverlayQuote,
+	validateOverlayCreateRequest
+} from './donation-overlay-routes.js';
+import { OVERLAY_CONFIRMATIONS_DEFAULT } from './donation-overlay-poller.js';
+
+const ZATOSHI_PER_ZEC = 100_000_000;
+
+/**
+ * Validate POST /v1/ziving/page. Extends overlay credentials with a
+ * required slug and optional public story + goal.
+ */
+export function validateZivingPageRequest(body, policy) {
+	const base = validateOverlayCreateRequest(body, policy);
+	const slug = normaliseCampaignSlug(body.slug);
+	let story = null;
+	if (body.story !== undefined && body.story !== null && body.story !== '') {
+		story = sanitiseText(body.story, OVERLAY_CONSTANTS.STORY_MAX_LEN);
+		if (story.length === 0) story = null;
+	}
+	let goalZatoshi = null;
+	if (body.goalZec !== undefined && body.goalZec !== null && body.goalZec !== '') {
+		const z = Number(body.goalZec);
+		if (!Number.isFinite(z) || z <= 0 || z > 1_000_000) {
+			throw new TypeError('goalZec must be a positive number up to 1,000,000');
+		}
+		goalZatoshi = String(Math.round(z * ZATOSHI_PER_ZEC));
+	}
+	return Object.freeze({ ...base, slug, story, goalZatoshi });
+}
+
+/** Public campaign view — no UFVK, no owner token. */
+export function publicCampaign(row, totals, { nowMs = Date.now(), urls = {} } = {}) {
+	const overlay = publicOverlay(row, { nowMs });
+	const totalZat = BigInt(totals?.totalZatoshi ?? '0');
+	const goalZat = row.goal_zatoshi != null ? BigInt(row.goal_zatoshi) : null;
+	return {
+		slug: row.slug ?? null,
+		overlayId: row.id,
+		label: row.label ?? null,
+		story: row.story ?? null,
+		address: row.address,
+		chain: row.chain,
+		minZec: overlay.minZec,
+		goalZec: goalZat != null ? Number(goalZat) / ZATOSHI_PER_ZEC : null,
+		raised: {
+			zec: Number(totalZat) / ZATOSHI_PER_ZEC,
+			zatoshi: totalZat.toString(),
+			donationCount: totals?.donationCount ?? 0,
+			percentOfGoal: goalZat != null && goalZat > 0n
+				? Math.min(100, Number((totalZat * 10000n) / goalZat) / 100)
+				: null
+		},
+		state: overlay.state,
+		active: overlay.active,
+		credit: overlay.credit,
+		created_at: overlay.created_at,
+		expires_at: overlay.expires_at,
+		urls
+	};
+}
+
+function publicEvent(row) {
+	return {
+		id: row.id,
+		amountZec: Number(row.amount_atomic) / ZATOSHI_PER_ZEC,
+		amountZatoshi: String(row.amount_atomic),
+		memo: row.memo ?? null,
+		status: row.status,
+		confirmations: row.confirmations ?? 0,
+		txHash: row.tx_hash ?? null,
+		firstSeenAt: new Date(row.first_seen_ms).toISOString()
+	};
+}
+
+/**
+ * Mount Ziving routes on `app`. Shares the overlay deps bundle.
+ * Returns { buildZivingStats }.
+ */
+export function registerZivingRoutes(app, deps) {
+	const {
+		watchDb,
+		priceOracle,
+		recvAddresses = {},
+		policy,
+		memoPrefix = 'PG',
+		encryptViewKey,
+		nfptHealth,
+		zivingPageUrlBase = '',
+		overlayPageUrlBase = '',
+		privateWatchReady,
+		privateNotConfigured,
+		now = () => Date.now(),
+		log = { info() {}, warn() {}, error() {} }
+	} = deps;
+
+	if (!privateWatchReady || !privateNotConfigured) {
+		throw new Error('registerZivingRoutes: missing gate helpers');
+	}
+	if (!policy || typeof policy !== 'object') {
+		throw new Error('registerZivingRoutes: policy is required');
+	}
+
+	if (watchDb) ensureDonationOverlaySchema(watchDb);
+
+	const zecEnabled = () => typeof recvAddresses.zcash === 'string' && recvAddresses.zcash.length > 0;
+	const ready = () => Boolean(privateWatchReady() && watchDb && priceOracle && typeof encryptViewKey === 'function');
+	const confirmationsRequired = policy.confirmations?.zcash ?? 8;
+
+	function urlsFor(row) {
+		const slug = row.slug;
+		const base = zivingPageUrlBase ? zivingPageUrlBase.replace(/\/$/u, '') : '';
+		const overlayBase = overlayPageUrlBase ? overlayPageUrlBase.replace(/\/$/u, '') : '';
+		return {
+			page: base && slug ? `${base}/p/${encodeURIComponent(slug)}` : null,
+			events: slug ? `/v1/ziving/page/${encodeURIComponent(slug)}/events` : null,
+			obsPage: overlayBase ? `${overlayBase}?overlay=${row.id}` : null,
+			overlayEvents: `/v1/overlay/${row.id}/events`
+		};
+	}
+
+	app.get('/v1/ziving', async () => {
+		const info = {
+			service: 'ziving',
+			tagline: 'Private Zcash fundraising — like giving, with a z.',
+			spec: 'JustGiving-style campaign pages on shielded ZEC. No accounts, no custody: donors pay your wallet directly; your UFVK (read-only) is encrypted at rest for donation monitoring.',
+			how_it_works: [
+				'1. Create a donation-only shielded wallet in Winbit32 (vault or receive wizard) and export the UFVK + unified address.',
+				'2. POST /v1/ziving/page { slug, label, story?, goalZec?, ufvk, address, amountUsdCents? } — returns your public page URL, ownerToken (once) and a ZEC funding quote.',
+				'3. Share the page; donations appear live on the page and in the OBS overlay feed.',
+				'4. Top up scanning credit with POST /v1/overlay/:id/topup (header x-overlay-token).'
+			],
+			winbit32: {
+				createVault: 'https://winbit32.com/#winbit32.exe/createvault.exe',
+				receiveWizard: 'https://winbit32.com/#winbit32.exe/zcashrecv.exe',
+				purse: 'https://winbit32.com/#winbit32.exe/purse.exe'
+			},
+			pricing: {
+				model: 'prepaid credit meter, funded in ZEC (memo-token quote)',
+				rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.DAY_RATE_ATOMIC),
+				grace_credit_usd: atomicToUsdString(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC),
+				min_usd: policy.minUsdCents / 100,
+				max_usd: policy.maxUsdCents / 100
+			},
+			privacy: 'we store: your UFVK (AES-256-GCM encrypted), your public receive address, optional label/story/goal. Donation events (amount + memo) prune after 30 days. No accounts, email or IPs.',
+			zec_funding_enabled: zecEnabled()
+		};
+		return info;
+	});
+
+	const createRouteOpts = { config: { rateLimit: { max: OVERLAY_CREATE_PER_IP_PER_MIN, timeWindow: '1 minute' } } };
+	app.post('/v1/ziving/page', createRouteOpts, async (req, reply) => {
+		if (!ready()) return privateNotConfigured(reply);
+		if (!zecEnabled()) {
+			return reply.code(503).send({
+				error: { code: 'zec_funding_not_configured', message: 'ZEC funding is not enabled on this server (ZEC_RECV_ADDRESS unset).' }
+			});
+		}
+
+		let input;
+		try { input = validateZivingPageRequest(req.body ?? {}, policy); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+
+		if (getOverlayBySlug(watchDb, input.slug)) {
+			return reply.code(409).send({ error: { code: 'slug_taken', message: `slug "${input.slug}" is already in use` } });
+		}
+
+		const health = await nfptHealth();
+		if (!health?.ok) {
+			return reply.code(502).send({
+				error: { code: 'nfpt_upstream_unavailable', message: 'Upstream scanner is not reachable; refusing to create page.', nfpt: health }
+			});
+		}
+
+		let price;
+		try { price = await priceOracle.getUsdPrice('zcash'); }
+		catch (err) {
+			log.warn({ err: err?.message ?? String(err) }, 'ziving: price oracle unavailable');
+			return reply.code(503).send({ error: { code: 'price_unavailable', message: 'could not fetch a live exchange rate; please retry shortly' } });
+		}
+
+		let created;
+		try {
+			created = createOverlay(watchDb, {
+				address: input.address,
+				ufvkCiphertext: encryptViewKey(input.ufvk),
+				birthdayHeight: input.birthdayHeight,
+				label: input.label,
+				minZatoshi: input.minZatoshi,
+				slug: input.slug,
+				story: input.story,
+				goalZatoshi: input.goalZatoshi,
+				nowMs: now()
+			});
+		} catch (err) {
+			if (String(err?.message ?? '').includes('UNIQUE constraint failed')) {
+				return reply.code(409).send({ error: { code: 'slug_taken', message: `slug "${input.slug}" is already in use` } });
+			}
+			throw err;
+		}
+
+		const { expectedAtomic, memo } = allocateQuoteAmount(watchDb, {
+			chain: 'zcash',
+			amountUsdCents: input.amountUsdCents,
+			priceUsd: price.usd,
+			spreadBps: policy.spreadBps,
+			memoPrefix
+		});
+		const nowMs = now();
+		const quoteRow = createQuote(watchDb, {
+			id: randomUUID(),
+			watchId: created.id,
+			watchToken: created.ownerToken,
+			chain: 'zcash',
+			recvAddress: recvAddresses.zcash,
+			memo,
+			quotedUsdCents: input.amountUsdCents,
+			expectedAtomic,
+			usdPriceMilli: Math.round(price.usd * 1000),
+			spreadBps: policy.spreadBps,
+			createdAtMs: nowMs,
+			expiresAtMs: nowMs + policy.quoteTtlSec * 1000
+		});
+
+		const row = getOverlay(watchDb, created.id);
+		const totals = sumConfirmedDonations(watchDb, created.id);
+		log.info({ slug: input.slug, overlayId: created.id, usdCents: input.amountUsdCents }, 'ziving: page created awaiting ZEC funding');
+
+		return reply.code(201).send({
+			slug: input.slug,
+			overlayId: created.id,
+			ownerToken: created.ownerToken,
+			status: 'active_awaiting_payment',
+			graceNote: `The page is live NOW on $${atomicToUsdString(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC)} of grace credit (~1.5 days). Pay the quote below and ${formatUsdCents(input.amountUsdCents)} of credit lands automatically after ${confirmationsRequired} confirmations.`,
+			urls: urlsFor(row),
+			payment: publicOverlayQuote(quoteRow, { confirmationsRequired }),
+			page: publicCampaign(row, totals, { nowMs, urls: urlsFor(row) }),
+			note: 'Keep the ownerToken safe — shown exactly ONCE. Use it with /v1/overlay/:id/topup and DELETE /v1/overlay/:id. Recommend a donation-only wallet; a UFVK reveals all incoming amounts and memos.'
+		});
+	});
+
+	app.get('/v1/ziving/page/:slug', async (req, reply) => {
+		if (!watchDb) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const nowMs = now();
+		const totals = sumConfirmedDonations(watchDb, row.id);
+		return publicCampaign(row, totals, { nowMs, urls: urlsFor(row) });
+	});
+
+	app.get('/v1/ziving/page/:slug/events', async (req, reply) => {
+		if (!watchDb) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const sinceId = Number(req.query?.sinceId ?? 0) || 0;
+		const events = listEventsSince(watchDb, row.id, { sinceId });
+		return {
+			slug: row.slug,
+			overlayId: row.id,
+			label: row.label ?? null,
+			active: row.cancelled !== 1 && Number(row.credit_atomic ?? 0) > 0,
+			cursor: events.length > 0 ? events[events.length - 1].id : sinceId,
+			pollSeconds: 10,
+			displayConfirmations: OVERLAY_CONFIRMATIONS_DEFAULT,
+			events: events.map(publicEvent)
+		};
+	});
+
+	function buildZivingStats() {
+		if (!watchDb) return { enabled: false, reason: 'watch DB not opened' };
+		const pages = watchDb.prepare('SELECT COUNT(*) AS n FROM donation_overlays WHERE slug IS NOT NULL').get()?.n ?? 0;
+		return { enabled: ready() && zecEnabled(), campaign_pages: pages };
+	}
+
+	return { buildZivingStats };
+}

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Donation Overlay</title>
+<style>
+	/* Transparent stage for OBS browser sources. Add this page with
+	   "Custom CSS" left empty — the background is already transparent. */
+	html, body {
+		margin: 0;
+		padding: 0;
+		background: transparent;
+		overflow: hidden;
+		font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+	}
+	#stage {
+		position: fixed;
+		inset: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		justify-content: flex-start;
+		gap: 12px;
+		padding: 18px;
+		pointer-events: none;
+	}
+	.alert {
+		min-width: 280px;
+		max-width: 460px;
+		background: linear-gradient(135deg, rgba(20, 18, 38, 0.94), rgba(52, 22, 78, 0.94));
+		border: 1px solid rgba(244, 183, 40, 0.55);
+		border-radius: 14px;
+		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+		color: #fff;
+		padding: 14px 18px;
+		animation: slideIn 0.45s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+	}
+	.alert.leaving { animation: slideOut 0.4s ease-in forwards; }
+	.alert .head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.alert .amount {
+		font-size: 1.5rem;
+		font-weight: 700;
+		color: #f4b728; /* Zcash gold */
+		white-space: nowrap;
+	}
+	.alert .state {
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		opacity: 0.7;
+	}
+	.alert .memo {
+		margin-top: 6px;
+		font-size: 1.02rem;
+		line-height: 1.35;
+		word-wrap: break-word;
+		white-space: pre-wrap;
+	}
+	.alert .label {
+		margin-top: 8px;
+		font-size: 0.72rem;
+		opacity: 0.55;
+	}
+	#status {
+		position: fixed;
+		left: 10px;
+		bottom: 8px;
+		font-size: 0.7rem;
+		color: rgba(255, 255, 255, 0.45);
+	}
+	@keyframes slideIn {
+		from { transform: translateX(120%); opacity: 0; }
+		to   { transform: translateX(0);    opacity: 1; }
+	}
+	@keyframes slideOut {
+		from { transform: translateX(0);    opacity: 1; }
+		to   { transform: translateX(120%); opacity: 0; }
+	}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="status"></div>
+<script>
+(() => {
+	'use strict';
+
+	// URL parameters:
+	//   overlay = ov_...   (required) the overlay id from POST /v1/overlay
+	//   api     = base URL (optional) defaults to this page's origin
+	//   show    = seen|confirmed  when to announce (default: seen)
+	//   hold    = seconds an alert stays on screen (default 9)
+	const params = new URLSearchParams(location.search);
+	const OVERLAY_ID = params.get('overlay') || '';
+	const API_BASE = (params.get('api') || location.origin).replace(/\/$/, '');
+	const ANNOUNCE_AT = params.get('show') === 'confirmed' ? 'confirmed' : 'seen';
+	const HOLD_MS = Math.max(3, Number(params.get('hold')) || 9) * 1000;
+	const DEFAULT_POLL_MS = 10_000;
+	const MAX_QUEUE = 20;
+	const ZATOSHI_PER_ZEC = 100_000_000;
+
+	const stage = document.getElementById('stage');
+	const statusEl = document.getElementById('status');
+
+	if (!OVERLAY_ID) {
+		statusEl.textContent = 'Missing ?overlay=ov_… parameter';
+		return;
+	}
+
+	// Announced-event memory so a page refresh doesn't replay history:
+	// persist the cursor in localStorage; on first ever load, fast-forward
+	// past everything already in the feed.
+	const CURSOR_KEY = `donation-overlay-cursor:${OVERLAY_ID}`;
+	let cursor = Number(localStorage.getItem(CURSOR_KEY) || 0) || 0;
+	let bootstrapped = cursor > 0;
+	const queue = [];
+	let showing = false;
+
+	function fmtZec(zatoshi) {
+		const zec = Number(zatoshi) / ZATOSHI_PER_ZEC;
+		return zec >= 1 ? zec.toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : zec.toFixed(8).replace(/0+$/, '');
+	}
+
+	function showNext() {
+		if (showing || queue.length === 0) return;
+		showing = true;
+		const ev = queue.shift();
+		const card = document.createElement('div');
+		card.className = 'alert';
+		const memoHtml = ev.memo ? `<div class="memo"></div>` : '';
+		card.innerHTML = `
+			<div class="head">
+				<span class="amount">+${fmtZec(ev.amountZatoshi)} ZEC</span>
+				<span class="state">${ev.status}</span>
+			</div>
+			${memoHtml}
+			<div class="label">shielded donation</div>`;
+		if (ev.memo) card.querySelector('.memo').textContent = ev.memo; // textContent — never inject donor HTML
+		stage.appendChild(card);
+		setTimeout(() => {
+			card.classList.add('leaving');
+			setTimeout(() => {
+				card.remove();
+				showing = false;
+				showNext();
+			}, 420);
+		}, HOLD_MS);
+	}
+
+	async function poll() {
+		let pollMs = DEFAULT_POLL_MS;
+		try {
+			const res = await fetch(`${API_BASE}/v1/overlay/${encodeURIComponent(OVERLAY_ID)}/events?sinceId=${cursor}`);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const body = await res.json();
+			pollMs = Math.max(3, Number(body.pollSeconds) || 10) * 1000;
+			const events = Array.isArray(body.events) ? body.events : [];
+			for (const ev of events) {
+				if (ev.id > cursor) cursor = ev.id;
+				if (!bootstrapped) continue; // first load: skip history
+				if (ANNOUNCE_AT === 'confirmed' && ev.status !== 'confirmed') {
+					// Not confirmed yet — do NOT advance past it so we
+					// re-see it once it flips. Rewind the cursor.
+					cursor = Math.min(cursor, ev.id - 1);
+					break;
+				}
+				if (queue.length < MAX_QUEUE) queue.push(ev);
+			}
+			bootstrapped = true;
+			localStorage.setItem(CURSOR_KEY, String(cursor));
+			statusEl.textContent = body.active === false ? 'overlay paused (out of credit)' : '';
+			showNext();
+		}
+		catch (err) {
+			statusEl.textContent = `reconnecting… (${err.message})`;
+		}
+		setTimeout(poll, pollMs);
+	}
+
+	poll();
+})();
+</script>
+</body>
+</html>
