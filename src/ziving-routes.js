@@ -8,6 +8,7 @@
 // Surface:
 //   GET  /v1/ziving                         metadata + pricing (scan + homepage feature)
 //   GET  /v1/ziving/featured                homepage-promoted campaigns
+//   GET  /v1/ziving/activity                latest confirmed gifts + newest pages (homepage feed)
 //   POST /v1/ziving/page                    create campaign (rate-limited)
 //   GET  /v1/ziving/page/:slug              public page data + totals
 //   GET  /v1/ziving/page/:slug/events       donation feed (cursor-paginated)
@@ -32,6 +33,8 @@ import {
 	getOverlayBySlug,
 	getOverlayAuthorised,
 	listEventsSince,
+	listRecentCampaignDonations,
+	listRecentCampaigns,
 	normaliseCampaignSlug,
 	sumConfirmedDonations,
 	listFeaturedCampaigns,
@@ -221,6 +224,28 @@ export function registerZivingRoutes(app, deps) {
 				feature_rate_per_day_usd: atomicToUsdString(OVERLAY_CONSTANTS.FEATURE_DAY_RATE_ATOMIC)
 			}
 		};
+	});
+
+	// Public homepage activity feed: latest confirmed gifts across all pages
+	// plus the newest live pages. Everything here is already public on the
+	// individual campaign pages — this is just the aggregated view.
+	app.get('/v1/ziving/activity', async () => {
+		if (!watchDb) return { donations: [], pages: [], pollSeconds: 30 };
+		const nowMs = now();
+		const base = zivingPageUrlBase ? zivingPageUrlBase.replace(/\/$/u, '') : '';
+		const donations = listRecentCampaignDonations(watchDb, { limit: 12 }).map((r) => ({
+			slug: r.slug,
+			label: r.label ?? null,
+			amountZec: Number(r.amount_atomic) / ZATOSHI_PER_ZEC,
+			memo: r.memo ?? null,
+			at: new Date(r.first_seen_ms).toISOString(),
+			pageUrl: base ? `${base}/p/${encodeURIComponent(r.slug)}` : null
+		}));
+		const pages = listRecentCampaigns(watchDb, { limit: 6 }).map((row) => {
+			const totals = sumConfirmedDonations(watchDb, row.id);
+			return publicCampaign(row, totals, { nowMs, urls: urlsFor(row) });
+		});
+		return { donations, pages, pollSeconds: 30 };
 	});
 
 	const createRouteOpts = { config: { rateLimit: { max: OVERLAY_CREATE_PER_IP_PER_MIN, timeWindow: '1 minute' } } };

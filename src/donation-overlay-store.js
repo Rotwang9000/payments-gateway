@@ -326,6 +326,31 @@ export function listFeaturedCampaigns(db, { nowMs = Date.now(), limit = OVERLAY_
 	`).all(nowMs, cap);
 }
 
+/** Newest campaign pages (public slugs, non-cancelled, still on credit). */
+export function listRecentCampaigns(db, { limit = 6 } = {}) {
+	const cap = Math.min(Math.max(1, Number(limit) || 1), OVERLAY_CONSTANTS.FEATURED_LIST_MAX);
+	return db.prepare(`
+		SELECT * FROM donation_overlays
+		WHERE slug IS NOT NULL AND cancelled = 0 AND credit_atomic > 0
+		ORDER BY created_at_ms DESC
+		LIMIT ?
+	`).all(cap);
+}
+
+/** Latest confirmed donations across campaign pages, newest first. */
+export function listRecentCampaignDonations(db, { limit = 12 } = {}) {
+	const cap = Math.min(Math.max(1, Number(limit) || 1), OVERLAY_CONSTANTS.EVENTS_PAGE_MAX);
+	return db.prepare(`
+		SELECT e.id, e.amount_atomic, e.memo, e.first_seen_ms, o.slug, o.label
+		FROM donation_events e
+		JOIN donation_overlays o ON o.id = e.overlay_id
+		WHERE o.slug IS NOT NULL AND o.cancelled = 0
+		  AND e.suppressed = 0 AND e.status = 'confirmed'
+		ORDER BY e.id DESC
+		LIMIT ?
+	`).all(cap);
+}
+
 /**
  * Fetch an overlay gated by the owner token (constant-time compare).
  * Returns the row, { error: 'not_found' }, or { error: 'forbidden' }.

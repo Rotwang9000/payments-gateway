@@ -165,6 +165,43 @@ describe('ziving routes', () => {
 		expect(body.events[0].memo).toBe('hi');
 	});
 
+	test('GET /v1/ziving/activity lists recent confirmed gifts and newest pages', async () => {
+		await createPage(app);
+		const overlayId = getOverlayBySlug(db, 'alice-run').id;
+		recordDonationEvent(db, {
+			overlayId,
+			amountAtomic: '25000000',
+			memo: 'go alice',
+			confirmed: true,
+			nowMs: NOW
+		});
+		// Unconfirmed ('seen') gifts must not leak into the public feed.
+		recordDonationEvent(db, {
+			overlayId,
+			amountAtomic: '5000000',
+			confirmed: false,
+			nowMs: NOW
+		});
+
+		const res = await app.inject({ method: 'GET', url: '/v1/ziving/activity' });
+		expect(res.statusCode).toBe(200);
+		const body = res.json();
+
+		expect(body.donations).toHaveLength(1);
+		expect(body.donations[0]).toMatchObject({
+			slug: 'alice-run',
+			label: 'Alice runs for cats',
+			amountZec: 0.25,
+			memo: 'go alice',
+			pageUrl: 'https://ziving.org/p/alice-run'
+		});
+
+		expect(body.pages).toHaveLength(1);
+		expect(body.pages[0].slug).toBe('alice-run');
+		expect(body.pages[0].raised.zec).toBe(0.25);
+		expect(body.pages[0].urls.page).toBe('https://ziving.org/p/alice-run');
+	});
+
 	test('duplicate slug returns 409', async () => {
 		await createPage(app);
 		const res = await createPage(app);
