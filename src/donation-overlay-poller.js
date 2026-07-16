@@ -57,7 +57,15 @@ export const OVERLAY_CONFIRMATIONS_DEFAULT = 3;
 
 /** Scan lower bound for an overlay: last scanned height minus the reorg margin, floored at the birthday. */
 export function scanBoundsForOverlay(overlay) {
-	const floor = overlay.birthday_height ?? ZCASH_NU6_HEIGHT;
+	let floor = overlay.birthday_height ?? ZCASH_NU6_HEIGHT;
+	// Notes at/below baseline_height (chain tip at page creation) are
+	// pre-existing balance and never shown, so walking the chain below it
+	// is pure waste — a wallet-birthday floor of NU6 would otherwise cost
+	// a ~370k-block first scan that can't finish inside one poller tick.
+	const baseline = Number(overlay.baseline_height);
+	if (Number.isInteger(baseline) && baseline > ZCASH_RESCAN_MARGIN_BLOCKS) {
+		floor = Math.max(floor, baseline - ZCASH_RESCAN_MARGIN_BLOCKS);
+	}
 	const scanned = Number(overlay.last_scanned_height ?? 0) || 0;
 	const birthday = scanned > ZCASH_RESCAN_MARGIN_BLOCKS
 		? Math.max(floor, scanned - ZCASH_RESCAN_MARGIN_BLOCKS)

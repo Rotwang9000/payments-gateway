@@ -153,6 +153,20 @@ describe('scanBoundsForOverlay', () => {
 		expect(scanBoundsForOverlay({ birthday_height: 3_299_500, last_scanned_height: 3_300_000 }))
 			.toEqual({ birthdayHeight: 3_299_500 });
 	});
+
+	test('baseline_height lifts a stale wallet birthday to just below the creation tip', () => {
+		expect(scanBoundsForOverlay({ birthday_height: 3_042_000, last_scanned_height: null, baseline_height: 3_412_300 }))
+			.toEqual({ birthdayHeight: 3_411_100 });
+		// Explicit birthday above the baseline still wins.
+		expect(scanBoundsForOverlay({ birthday_height: 3_413_000, last_scanned_height: null, baseline_height: 3_412_300 }))
+			.toEqual({ birthdayHeight: 3_413_000 });
+		// Pre-migration rows (no baseline) keep the old behaviour.
+		expect(scanBoundsForOverlay({ birthday_height: 3_200_000, last_scanned_height: null, baseline_height: null }))
+			.toEqual({ birthdayHeight: 3_200_000 });
+		// Resumed overlays still advance from last_scanned_height.
+		expect(scanBoundsForOverlay({ birthday_height: 3_042_000, last_scanned_height: 3_413_500, baseline_height: 3_412_300 }))
+			.toEqual({ birthdayHeight: 3_412_300 });
+	});
 });
 
 describe('runOverlayTick', () => {
