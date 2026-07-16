@@ -90,6 +90,11 @@ CREATE TABLE IF NOT EXISTS donation_overlays (
 	scan_errors           INTEGER DEFAULT 0,
 	cancelled             INTEGER DEFAULT 0,
 
+	-- chain tip at page creation; notes at/below this height are the
+	-- wallet's pre-existing balance (suppressed on first scan), notes
+	-- above it are genuine donations. NULL on pre-migration rows.
+	baseline_height       INTEGER,
+
 	-- optional Ziving campaign page fields (public by design)
 	slug                  TEXT UNIQUE,
 	story                 TEXT,
@@ -156,6 +161,7 @@ function migrateDonationOverlaySchema(db) {
 	if (!cols.has('story')) db.exec('ALTER TABLE donation_overlays ADD COLUMN story TEXT');
 	if (!cols.has('goal_zatoshi')) db.exec('ALTER TABLE donation_overlays ADD COLUMN goal_zatoshi TEXT');
 	if (!cols.has('featured_until_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN featured_until_ms INTEGER');
+	if (!cols.has('baseline_height')) db.exec('ALTER TABLE donation_overlays ADD COLUMN baseline_height INTEGER');
 	db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_overlay_slug_unique ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_slug ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_featured ON donation_overlays(featured_until_ms) WHERE featured_until_ms IS NOT NULL');
@@ -190,6 +196,7 @@ export function createOverlay(db, {
 	address,
 	ufvkCiphertext,
 	birthdayHeight = null,
+	baselineHeight = null,
 	label = null,
 	minZatoshi = null,
 	slug = null,
@@ -216,10 +223,10 @@ export function createOverlay(db, {
 	);
 	db.prepare(`
 		INSERT INTO donation_overlays
-			(id, owner_token_hash, chain, address, ufvk_ct, birthday_height, label, min_zatoshi,
+			(id, owner_token_hash, chain, address, ufvk_ct, birthday_height, baseline_height, label, min_zatoshi,
 			 slug, story, goal_zatoshi,
 			 created_at_ms, expires_at_ms, credit_atomic, credit_topups_atomic, credit_last_billed_ms)
-		VALUES (@id, @hash, 'zcash', @address, @ufvkCt, @birthday, @label, @minZat,
+		VALUES (@id, @hash, 'zcash', @address, @ufvkCt, @birthday, @baseline, @label, @minZat,
 		        @slug, @story, @goalZat,
 		        @now, @expires, @credit, @credit, @now)
 	`).run({
@@ -228,6 +235,7 @@ export function createOverlay(db, {
 		address,
 		ufvkCt: ufvkCiphertext,
 		birthday: birthdayHeight ?? null,
+		baseline: Number.isInteger(baselineHeight) ? baselineHeight : null,
 		label: label ?? null,
 		minZat: minZatoshi != null ? String(minZatoshi) : null,
 		slug: slug ?? null,

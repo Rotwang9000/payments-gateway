@@ -273,6 +273,13 @@ export function registerZivingRoutes(app, deps) {
 				error: { code: 'nfpt_upstream_unavailable', message: 'Upstream scanner is not reachable; refusing to create page.', nfpt: health }
 			});
 		}
+		// Chain tip at creation: notes at/below this are the wallet's
+		// pre-existing balance; anything above is a real donation. Lets the
+		// scanner's first pass keep a donation that lands before it runs,
+		// instead of blanket-suppressing every note it finds.
+		const baselineHeight = Number.isInteger(health.lightwallet?.blockHeight)
+			? health.lightwallet.blockHeight
+			: null;
 
 		let price;
 		try { price = await priceOracle.getUsdPrice('zcash'); }
@@ -287,6 +294,7 @@ export function registerZivingRoutes(app, deps) {
 				address: input.address,
 				ufvkCiphertext: encryptViewKey(input.ufvk),
 				birthdayHeight: input.birthdayHeight,
+				baselineHeight,
 				label: input.label,
 				minZatoshi: input.minZatoshi,
 				slug: input.slug,

@@ -58,6 +58,11 @@ describe('overlay lifecycle', () => {
 		expect(row.credit_atomic).toBe(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC);
 	});
 
+	test('baseline_height persists when supplied and is null otherwise', () => {
+		expect(getOverlay(db, makeOverlay(db, { baselineHeight: 3_100_000 }).id).baseline_height).toBe(3_100_000);
+		expect(getOverlay(db, makeOverlay(db, { slug: 'no-baseline' }).id).baseline_height).toBeNull();
+	});
+
 	test('owner-token auth: wrong token forbidden, unknown id not_found', () => {
 		const created = makeOverlay(db);
 		expect(getOverlayAuthorised(db, created.id, created.ownerToken).id).toBe(created.id);

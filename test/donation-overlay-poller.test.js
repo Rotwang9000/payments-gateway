@@ -60,6 +60,43 @@ describe('ingestScanResult', () => {
 		expect(getOverlay(db, id).last_scanned_height).toBe(3_100_010);
 	});
 
+	test('first scan keeps donations above the creation baseline, suppresses pre-existing notes', () => {
+		const { id } = makeOverlay(db, { baselineHeight: 3_100_000 });
+		const out = ingestScanResult(db, getOverlay(db, id), {
+			chainHeight: 3_100_010, scannedHeight: 3_100_010,
+			incoming: [
+				note({ txHash: 'at-tip', blockHeight: 3_100_000 }), // == baseline → pre-existing
+				note({ txHash: 'older', blockHeight: 3_099_500 }),  // below baseline → pre-existing
+				note({ txHash: 'gift', blockHeight: 3_100_005 })    // above baseline → donation
+			]
+		}, { nowMs: NOW });
+		expect(out.inserted).toBe(3);
+		expect(out.suppressed).toBe(2);
+		const feed = listEventsSince(db, id);
+		expect(feed).toHaveLength(1);
+		expect(feed[0].tx_hash).toBe('gift');
+	});
+
+	test('first scan keeps an unmined donation (null height) even with a baseline', () => {
+		const { id } = makeOverlay(db, { baselineHeight: 3_100_000 });
+		const out = ingestScanResult(db, getOverlay(db, id), {
+			chainHeight: 3_100_000, scannedHeight: 3_100_000,
+			incoming: [note({ txHash: 'mempool', blockHeight: null })]
+		}, { nowMs: NOW });
+		expect(out.suppressed).toBe(0);
+		expect(listEventsSince(db, id)).toHaveLength(1);
+	});
+
+	test('with no baseline recorded, the first scan still suppresses every note (legacy rule)', () => {
+		const { id } = makeOverlay(db); // no baselineHeight
+		const out = ingestScanResult(db, getOverlay(db, id), {
+			chainHeight: 3_100_010, scannedHeight: 3_100_010,
+			incoming: [note({ txHash: 'a' }), note({ txHash: 'b', blockHeight: 3_100_009 })]
+		}, { nowMs: NOW });
+		expect(out.suppressed).toBe(2);
+		expect(listEventsSince(db, id)).toHaveLength(0);
+	});
+
 	test('subsequent scans surface new notes; re-scanned notes dedupe', () => {
 		const { id } = makeOverlay(db);
 		ingestScanResult(db, getOverlay(db, id), { chainHeight: 10, scannedHeight: 3_100_000, incoming: [note()] }, { nowMs: NOW });

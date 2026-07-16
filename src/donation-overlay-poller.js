@@ -111,21 +111,37 @@ export function makeOverlayCreditApplier(db) {
  * Ingest one scan result for an overlay. Pure DB state machine —
  * exported for direct unit testing.
  *
- * Baseline rule: when the overlay has never been scanned
- * (last_scanned_height IS NULL) every note is recorded suppressed.
+ * Baseline rule: on the overlay's first scan (last_scanned_height IS NULL)
+ * a note is suppressed only when it is the wallet's pre-existing balance —
+ * i.e. mined at or below `baseline_height` (the chain tip when the page was
+ * created). Notes above that height, or unmined notes, are genuine
+ * donations and shown even on the first scan. Pre-migration rows have a
+ * NULL baseline_height; for them we keep the old conservative behaviour and
+ * suppress every note on the first scan.
  */
 export function ingestScanResult(db, overlay, { chainHeight = 0, scannedHeight = 0, incoming = [] }, {
 	confirmationsRequired = OVERLAY_CONFIRMATIONS_DEFAULT,
 	nowMs = Date.now()
 } = {}) {
-	const baseline = overlay.last_scanned_height == null;
+	const firstScan = overlay.last_scanned_height == null;
+	const baselineHeight = Number.isInteger(overlay.baseline_height) ? overlay.baseline_height : null;
 	const minZat = safeBig(overlay.min_zatoshi) ?? 0n;
 	const out = { inserted: 0, suppressed: 0, confirmed_updates: 0 };
+
+	// A note is pre-existing balance (suppress) only on the first scan, and
+	// only when we can place it at/below the creation tip. No baseline
+	// recorded → suppress all first-scan notes (legacy conservative rule).
+	const isPreExisting = (blockHeight) => {
+		if (!firstScan) return false;
+		if (baselineHeight == null) return true;
+		return blockHeight != null && blockHeight <= baselineHeight;
+	};
 
 	for (const p of incoming) {
 		const amount = safeBig(p.amountAtomic);
 		if (amount === null || amount <= 0n) continue;
-		if (!baseline && minZat > 0n && amount < minZat) continue;
+		const suppressed = isPreExisting(p.blockHeight ?? null);
+		if (!suppressed && minZat > 0n && amount < minZat) continue;
 		const confs = computeConfirmations(chainHeight, p.blockHeight);
 		const { inserted } = recordDonationEvent(db, {
 			overlayId: overlay.id,
@@ -135,12 +151,12 @@ export function ingestScanResult(db, overlay, { chainHeight = 0, scannedHeight =
 			blockHeight: p.blockHeight ?? null,
 			confirmations: confs,
 			confirmed: confs >= confirmationsRequired,
-			suppressed: baseline,
+			suppressed,
 			nowMs
 		});
 		if (inserted) {
 			out.inserted += 1;
-			if (baseline) out.suppressed += 1;
+			if (suppressed) out.suppressed += 1;
 		}
 	}
 
