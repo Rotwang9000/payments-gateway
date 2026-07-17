@@ -81,7 +81,14 @@ function makeScan(nfptClient) {
 			address: config.zecRecvAddress,
 			viewKey: config.zecRecvUfvk,
 			birthdayHeight: config.zecRecvBirthdayHeight > 0 ? config.zecRecvBirthdayHeight : ZEC_NU6_BIRTHDAY,
-			pollIntervalMs: NFPT_POLL_INTERVAL_MS
+			pollIntervalMs: NFPT_POLL_INTERVAL_MS,
+			maxWaitMs: config.zecRecvScanMaxWaitMs,
+			// If the scan can't finish inside maxWaitMs, walk away WITHOUT
+			// cancelling: NFPT discards a cancelled job's progress but caches a
+			// completed one, so leaving it running lets the server finish and
+			// makes the next tick an incremental (fast) scan. Cancelling here
+			// was why the receive wallet never saw a single payment.
+			cancelOnTimeout: false
 		});
 	};
 }
@@ -129,6 +136,7 @@ async function main() {
 			scan,
 			applyCredit,
 			confirmations,
+			matchGraceMs: config.cryptoTopupMatchGraceMs,
 			logger
 		});
 		logJson('info', { event: 'crypto_recv_tick', chains, ...summary });

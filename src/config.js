@@ -288,10 +288,23 @@ export function buildConfig(env = process.env) {
 		cryptoTopupMinUsdCents: asInt(env, 'CRYPTO_TOPUP_MIN_USD_CENTS', 200),
 		cryptoTopupMaxUsdCents: asInt(env, 'CRYPTO_TOPUP_MAX_USD_CENTS', 50_000),
 		cryptoTopupSpreadBps: asInt(env, 'CRYPTO_TOPUP_SPREAD_BPS', 400),
-		cryptoTopupQuoteTtlSec: asInt(env, 'CRYPTO_TOPUP_QUOTE_TTL_SEC', 900),
+		// Pay-by window. ZEC settling alone needs 8 confs (~10 min of blocks),
+		// so anything under an hour risks expiring a quote the payer honoured —
+		// the grace window below is the safety net, not the primary path.
+		cryptoTopupQuoteTtlSec: asInt(env, 'CRYPTO_TOPUP_QUOTE_TTL_SEC', 3_600),
+		// How long after expiry a matching payment can still settle a quote.
+		// Memo/amount attribution makes late settling honest; the deadline
+		// only locked the rate.
+		cryptoTopupMatchGraceMs: asInt(env, 'CRYPTO_TOPUP_MATCH_GRACE_MS', 7 * 86_400_000),
 		cryptoTopupXmrConfirmations: asInt(env, 'CRYPTO_TOPUP_XMR_CONFIRMATIONS', 10),
 		cryptoTopupZecConfirmations: asInt(env, 'CRYPTO_TOPUP_ZEC_CONFIRMATIONS', 8),
 		cryptoRecvPollIntervalSec: asInt(env, 'CRYPTO_RECV_POLL_INTERVAL_SEC', 60),
+		// Per-tick cap on waiting for the NFPT receive-wallet scan. The old
+		// library default (2 min) was shorter than a cold scan could ever
+		// finish in, so the scan restarted from scratch every tick and no
+		// payment was ever seen. The timer unit is oneshot, so a long run
+		// simply delays the next tick.
+		zecRecvScanMaxWaitMs: asInt(env, 'ZEC_RECV_SCAN_MAX_WAIT_MS', 480_000),
 		// Donation overlay + Ziving (ziving.org campaign pages)
 		overlayPageUrlBase: asString(env, 'OVERLAY_PAGE_URL_BASE', ''),
 		overlayMaxPerTick: asInt(env, 'OVERLAY_MAX_PER_TICK', 4),
