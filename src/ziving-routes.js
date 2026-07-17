@@ -46,6 +46,7 @@ import {
 	listRecentCampaignDonations,
 	listRecentCampaigns,
 	normaliseCampaignSlug,
+	RESERVED_SLUGS,
 	sumConfirmedDonations,
 	listFeaturedCampaigns,
 	createFeatureQuote,
@@ -80,6 +81,15 @@ const OVERLAY_RECOVER_PER_IP_PER_MIN = 10;
 export function validateZivingPageRequest(body, policy) {
 	const base = validateOverlayCreateRequest(body, policy);
 	const slug = normaliseCampaignSlug(body.slug);
+	// Creation is stricter than resolution: existing shorter slugs keep
+	// working, but new pages need a slug that can't be mistaken for a
+	// site route or a wildcard grab.
+	if (slug.length < OVERLAY_CONSTANTS.SLUG_CREATE_MIN_LEN) {
+		throw new TypeError(`slug must be at least ${OVERLAY_CONSTANTS.SLUG_CREATE_MIN_LEN} characters (a-z, 0-9, hyphen)`);
+	}
+	if (RESERVED_SLUGS.has(slug)) {
+		throw new TypeError(`slug "${slug}" is reserved — pick something more specific`);
+	}
 	let story = null;
 	if (body.story !== undefined && body.story !== null && body.story !== '') {
 		story = sanitiseText(body.story, OVERLAY_CONSTANTS.STORY_MAX_LEN);
@@ -564,7 +574,9 @@ export function registerZivingRoutes(app, deps) {
 		};
 	});
 
-	app.post('/v1/ziving/page/:slug/feature', async (req, reply) => {
+	// Token-gated, but each call mints quote rows — keep the same per-IP
+	// throttle as the other quote-minting routes.
+	app.post('/v1/ziving/page/:slug/feature', recoverOpts, async (req, reply) => {
 		if (!ready()) return privateNotConfigured(reply);
 		if (!zecEnabled()) {
 			return reply.code(503).send({ error: { code: 'zec_funding_not_configured', message: 'ZEC funding is not enabled on this server.' } });

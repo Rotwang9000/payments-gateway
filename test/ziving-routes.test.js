@@ -93,6 +93,20 @@ describe('validateZivingPageRequest', () => {
 		expect(() => validateZivingPageRequest({ slug: 'ab', ufvk: UFVK, address: ADDR }, POLICY))
 			.toThrow(/slug must be/);
 	});
+
+	test('creation demands at least 5 characters (reads still allow 3)', () => {
+		expect(() => validateZivingPageRequest({ slug: 'abcd', ufvk: UFVK, address: ADDR, amountUsdCents: 500 }, POLICY))
+			.toThrow(/at least 5 characters/);
+		const ok = validateZivingPageRequest({ slug: 'abcde', ufvk: UFVK, address: ADDR, amountUsdCents: 500 }, POLICY);
+		expect(ok.slug).toBe('abcde');
+	});
+
+	test('rejects reserved slugs (site routes + service impersonation)', () => {
+		for (const slug of ['manage', 'ziving', 'zcash', 'admin', 'overlay']) {
+			expect(() => validateZivingPageRequest({ slug, ufvk: UFVK, address: ADDR, amountUsdCents: 500 }, POLICY))
+				.toThrow(/reserved/);
+		}
+	});
 });
 
 describe('ziving routes', () => {

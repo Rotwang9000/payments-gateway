@@ -815,7 +815,7 @@ export function registerZivingMcpTools(server, opts = {}) {
 		title: 'Ziving — create a fundraising page',
 		description: 'Create a Ziving campaign page. POSTs to the gateway REST API and returns the public URL, one-time ownerToken, and a ZEC funding quote for scanning credit. Recommend a donation-only wallet: the UFVK reveals all incoming amounts and memos.',
 		inputSchema: {
-			slug: z.string().min(3).max(48).describe('URL slug, lowercase letters/digits/hyphens (e.g. alice-marathon).'),
+			slug: z.string().min(5).max(48).describe('URL slug, at least 5 chars, lowercase letters/digits/hyphens (e.g. alice-marathon). Common service words (ziving, zcash, admin, …) are reserved.'),
 			label: z.string().min(1).max(60).describe('Public campaign title.'),
 			ufvk: z.string().min(20).describe('Zcash UFVK (uview1…) — read-only view key, encrypted at rest.'),
 			address: z.string().min(20).describe('Shielded unified receive address (u1…) donors pay.'),

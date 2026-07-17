@@ -99,15 +99,17 @@ export function makeOverlayScanner(nfptClient, { pollIntervalMs = 4_000, maxWait
 export function makeOverlayCreditApplier(db) {
 	if (!db) throw new TypeError('makeOverlayCreditApplier: db required');
 	const CENTS_TO_ATOMIC_USDC = 10_000;
-	return ({ watchId, usdCents }) => {
+	return ({ watchId, usdCents, quoteId = null }) => {
 		if (!Number.isInteger(usdCents) || usdCents <= 0) return { ok: false, reason: 'invalid_amount' };
 		// Lost-key unlock payments settle first — they must never be
 		// mistaken for scan credit (the amount is deliberately small).
-		const rec = applyRecoveryUnlock(db, watchId, { usdCents });
+		// quoteId (when the poller supplies it) pins the dispatch to the
+		// exact quote that was paid instead of guessing by price.
+		const rec = applyRecoveryUnlock(db, watchId, { quoteId, usdCents });
 		if (rec.ok) return { ok: true, kind: 'recovery_unlock', unlockUntilMs: rec.unlockUntilMs };
 		if (rec.reason && rec.reason !== 'no_pending_recovery') return { ok: false, reason: rec.reason };
 		// Homepage feature quotes settle next (same overlay id, distinct cents).
-		const feat = applyFeaturePurchase(db, watchId, { usdCents });
+		const feat = applyFeaturePurchase(db, watchId, { quoteId, usdCents });
 		if (feat.ok) {
 			return { ok: true, kind: 'feature', featuredUntilMs: feat.featuredUntilMs, days: feat.days };
 		}

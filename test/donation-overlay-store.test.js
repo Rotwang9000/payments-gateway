@@ -220,6 +220,20 @@ describe('homepage feature quotes', () => {
 		expect(list[0].slug).toBe('promo-run');
 		expect(listFeaturedCampaigns(db, { nowMs: NOW + 3 * 86_400_000 })).toHaveLength(0);
 	});
+
+	test('quoteId dispatch settles exactly the paid quote — a same-priced scan top-up is not stolen', () => {
+		const created = makeOverlay(db, { slug: 'exact-quote', label: 'Exact' });
+		// One-day feature = $5 = the same 500¢ as a $5 scan top-up.
+		createFeatureQuote(db, { quoteId: 'q-feat', overlayId: created.id, days: 1, usdCents: 500, nowMs: NOW });
+		// The paid quote is the SCAN top-up (id 'q-scan'), not the feature.
+		const miss = applyFeaturePurchase(db, created.id, { quoteId: 'q-scan', usdCents: 500, nowMs: NOW });
+		expect(miss.ok).toBe(false);
+		expect(miss.reason).toBe('no_pending_feature'); // falls through to scan credit
+		// Paying the feature quote itself still settles it.
+		const hit = applyFeaturePurchase(db, created.id, { quoteId: 'q-feat', usdCents: 500, nowMs: NOW });
+		expect(hit.ok).toBe(true);
+		expect(hit.days).toBe(1);
+	});
 });
 
 describe('recovery codes, UFVK fingerprint lookup, wallet sessions', () => {

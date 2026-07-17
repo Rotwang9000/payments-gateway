@@ -58,7 +58,10 @@ export const OVERLAY_CONSTANTS = Object.freeze({
 	MEMO_MAX_LEN: 512,
 	LABEL_MAX_LEN: 60,
 	// Ziving campaign pages (JustGiving-style public slugs).
+	// Reads accept the historical minimum (3) so old links keep resolving;
+	// new pages must clear SLUG_CREATE_MIN_LEN.
 	SLUG_MIN_LEN: 3,
+	SLUG_CREATE_MIN_LEN: 5,
 	SLUG_MAX_LEN: 48,
 	STORY_MAX_LEN: 4000,
 	FEATURED_LIST_MAX: 24,
@@ -139,6 +142,18 @@ CREATE TABLE IF NOT EXISTS donation_events (
 CREATE INDEX IF NOT EXISTS idx_event_feed
 	ON donation_events(overlay_id, suppressed, id);
 `;
+
+/**
+ * Slugs that must never become campaign pages: site routes, obvious
+ * service impersonation, and generic words that would read as official.
+ */
+export const RESERVED_SLUGS = Object.freeze(new Set([
+	'admin', 'about', 'account', 'accounts', 'api', 'assets', 'blog', 'contact',
+	'create', 'docs', 'donate', 'events', 'faq', 'featured', 'gateway', 'help',
+	'home', 'index', 'legal', 'login', 'manage', 'official', 'overlay', 'pages',
+	'press', 'privacy', 'search', 'settings', 'signup', 'static', 'status',
+	'support', 'terms', 'wallet', 'winbit32', 'zcash', 'ziving'
+]));
 
 /** Normalise a Ziving campaign slug (lowercase URL segment). */
 export function normaliseCampaignSlug(value) {
@@ -367,13 +382,22 @@ export function createFeatureQuote(db, { quoteId, overlayId, days, usdCents, now
  * Settle a homepage-feature purchase: extend featured_until_ms from now
  * (or from the current featured_until if still live).
  */
-export function applyFeaturePurchase(db, overlayId, { days, usdCents, nowMs = Date.now() }) {
-	const pending = db.prepare(`
-		SELECT * FROM ziving_feature_quotes
-		WHERE overlay_id = ? AND usd_cents = ? AND settled = 0
-		ORDER BY created_at_ms DESC
-		LIMIT 1
-	`).get(overlayId, usdCents);
+export function applyFeaturePurchase(db, overlayId, { quoteId = null, days, usdCents, nowMs = Date.now() }) {
+	// With a quoteId we settle exactly the quote that was paid; the
+	// cents-match path is only a fallback for callers that predate quote
+	// ids (it can mis-dispatch when two products share a price, e.g. a
+	// $5 scan top-up vs a $5 one-day feature).
+	const pending = quoteId != null
+		? db.prepare(`
+			SELECT * FROM ziving_feature_quotes
+			WHERE quote_id = ? AND overlay_id = ? AND settled = 0
+		`).get(quoteId, overlayId)
+		: db.prepare(`
+			SELECT * FROM ziving_feature_quotes
+			WHERE overlay_id = ? AND usd_cents = ? AND settled = 0
+			ORDER BY created_at_ms DESC
+			LIMIT 1
+		`).get(overlayId, usdCents);
 	if (!pending) return { ok: false, reason: 'no_pending_feature' };
 	const row = getOverlay(db, overlayId);
 	if (!row) return { ok: false, reason: 'not_found' };
@@ -520,16 +544,23 @@ export function createRecoveryQuoteRow(db, { quoteId, overlayId, usdCents, nowMs
  * Mirrors applyFeaturePurchase's pending-row-by-cents dispatch.
  */
 export function applyRecoveryUnlock(db, overlayId, {
+	quoteId = null,
 	usdCents,
 	windowMs = OVERLAY_CONSTANTS.RECOVERY_UNLOCK_WINDOW_MS,
 	nowMs = Date.now()
 }) {
-	const pending = db.prepare(`
-		SELECT * FROM ziving_recovery_quotes
-		WHERE overlay_id = ? AND usd_cents = ? AND settled = 0
-		ORDER BY created_at_ms DESC
-		LIMIT 1
-	`).get(overlayId, usdCents);
+	// Same exact-quote dispatch as applyFeaturePurchase.
+	const pending = quoteId != null
+		? db.prepare(`
+			SELECT * FROM ziving_recovery_quotes
+			WHERE quote_id = ? AND overlay_id = ? AND settled = 0
+		`).get(quoteId, overlayId)
+		: db.prepare(`
+			SELECT * FROM ziving_recovery_quotes
+			WHERE overlay_id = ? AND usd_cents = ? AND settled = 0
+			ORDER BY created_at_ms DESC
+			LIMIT 1
+		`).get(overlayId, usdCents);
 	if (!pending) return { ok: false, reason: 'no_pending_recovery' };
 	const row = getOverlay(db, overlayId);
 	if (!row) return { ok: false, reason: 'not_found' };
