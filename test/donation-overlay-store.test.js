@@ -23,7 +23,16 @@ import {
 	createFeatureQuote,
 	applyFeaturePurchase,
 	listFeaturedCampaigns,
-	recoverOverlayOwnerByUfvk
+	recoverOverlayOwnerByUfvk,
+	normaliseRecoveryCode,
+	setOverlayRecoveryCode,
+	verifyOverlayRecoveryCode,
+	createRecoveryQuoteRow,
+	applyRecoveryUnlock,
+	claimOverlayRecovery,
+	findOverlaysByUfvk,
+	createOverlaySession,
+	ufvkFingerprint
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -210,5 +219,74 @@ describe('homepage feature quotes', () => {
 		expect(list).toHaveLength(1);
 		expect(list[0].slug).toBe('promo-run');
 		expect(listFeaturedCampaigns(db, { nowMs: NOW + 3 * 86_400_000 })).toHaveLength(0);
+	});
+});
+
+describe('recovery codes, UFVK fingerprint lookup, wallet sessions', () => {
+	let db;
+	beforeEach(() => { db = openDb(); });
+
+	test('recovery code round-trip is paste-tolerant and rotatable', () => {
+		const { id } = makeOverlay(db);
+		expect(verifyOverlayRecoveryCode(getOverlay(db, id), 'zrk-anything')).toBe(false); // no code yet
+		const { recoveryCode } = setOverlayRecoveryCode(db, id);
+		const row = getOverlay(db, id);
+		expect(verifyOverlayRecoveryCode(row, recoveryCode)).toBe(true);
+		expect(verifyOverlayRecoveryCode(row, recoveryCode.toUpperCase().replaceAll('-', ' '))).toBe(true);
+		expect(verifyOverlayRecoveryCode(row, 'zrk-wrong-wrong-wrng')).toBe(false);
+		expect(normaliseRecoveryCode(' ZRK-a B-c ')).toBe('zrkabc');
+		const second = setOverlayRecoveryCode(db, id);
+		expect(verifyOverlayRecoveryCode(getOverlay(db, id), recoveryCode)).toBe(false); // retired
+		expect(verifyOverlayRecoveryCode(getOverlay(db, id), second.recoveryCode)).toBe(true);
+	});
+
+	test('paid unlock opens a claim window; claim rotates token + code once', () => {
+		const { id, ownerToken } = makeOverlay(db);
+		setOverlayRecoveryCode(db, id);
+		expect(claimOverlayRecovery(db, id, { nowMs: NOW }).reason).toBe('not_unlocked');
+		createRecoveryQuoteRow(db, { quoteId: 'q1', overlayId: id, usdCents: 50, nowMs: NOW });
+		expect(applyRecoveryUnlock(db, id, { usdCents: 49, nowMs: NOW }).reason).toBe('no_pending_recovery');
+		const unlocked = applyRecoveryUnlock(db, id, { usdCents: 50, nowMs: NOW });
+		expect(unlocked.ok).toBe(true);
+		expect(unlocked.unlockUntilMs).toBe(NOW + OVERLAY_CONSTANTS.RECOVERY_UNLOCK_WINDOW_MS);
+		// Window respected: too late → refused.
+		expect(claimOverlayRecovery(db, id, { nowMs: unlocked.unlockUntilMs + 1 }).reason).toBe('not_unlocked');
+		const claimed = claimOverlayRecovery(db, id, { nowMs: NOW + 1000 });
+		expect(claimed.ok).toBe(true);
+		expect(claimed.ownerToken).not.toBe(ownerToken);
+		expect(getOverlayAuthorised(db, id, ownerToken).error).toBe('forbidden');
+		expect(getOverlayAuthorised(db, id, claimed.ownerToken).id).toBe(id);
+		// Window is single-use.
+		expect(claimOverlayRecovery(db, id, { nowMs: NOW + 2000 }).reason).toBe('not_unlocked');
+	});
+
+	test('findOverlaysByUfvk matches by fingerprint and backfills legacy rows', () => {
+		const ufvk = 'uview1alice-secret-key';
+		const withFp = makeOverlay(db, { slug: 'new-page', ufvkFingerprintHex: ufvkFingerprint(ufvk) });
+		// Legacy row: no fingerprint, invertible stub crypto.
+		const legacy = makeOverlay(db, { slug: 'old-page', ufvkCiphertext: `sealed:${ufvk}` });
+		const decrypt = (ct) => String(ct).replace(/^sealed:/u, '');
+		const found = findOverlaysByUfvk(db, ufvk, decrypt);
+		expect(found.map((r) => r.id).sort()).toEqual([withFp.id, legacy.id].sort());
+		// Backfilled: next lookup hits the index even without decrypt.
+		expect(getOverlay(db, legacy.id).ufvk_fingerprint).toBe(ufvkFingerprint(ufvk));
+		expect(findOverlaysByUfvk(db, ufvk, null).map((r) => r.id).sort())
+			.toEqual([withFp.id, legacy.id].sort());
+		expect(findOverlaysByUfvk(db, 'uview1someone-else', decrypt)).toHaveLength(0);
+		expect(findOverlaysByUfvk(db, 'not-a-ufvk', decrypt)).toHaveLength(0);
+	});
+
+	test('wallet sessions authorise like the owner token until they expire', () => {
+		const a = makeOverlay(db, { slug: 'page-a' });
+		const b = makeOverlay(db, { slug: 'page-b' });
+		const other = makeOverlay(db, { slug: 'page-c' });
+		const session = createOverlaySession(db, [a.id, b.id], { nowMs: NOW });
+		expect(session.token).toMatch(/^zses_/u);
+		expect(getOverlayAuthorised(db, a.id, session.token, { nowMs: NOW }).id).toBe(a.id);
+		expect(getOverlayAuthorised(db, b.id, session.token, { nowMs: NOW }).id).toBe(b.id);
+		expect(getOverlayAuthorised(db, other.id, session.token, { nowMs: NOW }).error).toBe('forbidden');
+		expect(getOverlayAuthorised(db, a.id, session.token, { nowMs: session.expiresAtMs + 1 }).error).toBe('forbidden');
+		// Owner tokens are untouched by sessions.
+		expect(getOverlayAuthorised(db, a.id, a.ownerToken).id).toBe(a.id);
 	});
 });

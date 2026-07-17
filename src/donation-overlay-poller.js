@@ -35,7 +35,8 @@ import {
 	listUnconfirmedEvents,
 	pruneOverlayData,
 	topupOverlayById,
-	applyFeaturePurchase
+	applyFeaturePurchase,
+	applyRecoveryUnlock
 } from './donation-overlay-store.js';
 
 // Zcash reorg safety margin (blocks) below the last scanned height —
@@ -100,7 +101,12 @@ export function makeOverlayCreditApplier(db) {
 	const CENTS_TO_ATOMIC_USDC = 10_000;
 	return ({ watchId, usdCents }) => {
 		if (!Number.isInteger(usdCents) || usdCents <= 0) return { ok: false, reason: 'invalid_amount' };
-		// Homepage feature quotes settle first (same overlay id, distinct cents).
+		// Lost-key unlock payments settle first — they must never be
+		// mistaken for scan credit (the amount is deliberately small).
+		const rec = applyRecoveryUnlock(db, watchId, { usdCents });
+		if (rec.ok) return { ok: true, kind: 'recovery_unlock', unlockUntilMs: rec.unlockUntilMs };
+		if (rec.reason && rec.reason !== 'no_pending_recovery') return { ok: false, reason: rec.reason };
+		// Homepage feature quotes settle next (same overlay id, distinct cents).
 		const feat = applyFeaturePurchase(db, watchId, { usdCents });
 		if (feat.ok) {
 			return { ok: true, kind: 'feature', featuredUntilMs: feat.featuredUntilMs, days: feat.days };

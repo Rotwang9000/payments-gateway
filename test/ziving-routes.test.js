@@ -45,6 +45,7 @@ function buildApp(db, over = {}) {
 		policy: POLICY,
 		memoPrefix: 'PG',
 		encryptViewKey: over.encryptViewKey ?? ((ufvk) => `ct:${ufvk.slice(0, 12)}`),
+		decryptViewKey: over.decryptViewKey ?? ((ct) => String(ct).replace(/^ct:/u, '')),
 		nfptHealth: over.nfptHealth ?? (async () => ({ ok: true })),
 		zivingPageUrlBase: over.zivingPageUrlBase ?? 'https://ziving.org',
 		overlayPageUrlBase: over.overlayPageUrlBase ?? 'https://ziving.org/overlay.html',
@@ -260,5 +261,137 @@ describe('ziving routes', () => {
 		expect(list.count).toBe(1);
 		expect(list.campaigns[0].slug).toBe(slug);
 		expect(list.campaigns[0].featured).toBe(true);
+	});
+});
+
+describe('ziving auth: recovery codes, wallet login, paid lost-key recovery', () => {
+	let db;
+	let app;
+
+	beforeEach(async () => {
+		db = openDb();
+		app = buildApp(db);
+		await app.ready();
+	});
+
+	test('create returns a recovery code and stores hash + UFVK fingerprint', async () => {
+		const res = await createPage(app);
+		expect(res.statusCode).toBe(201);
+		const body = res.json();
+		expect(body.recoveryCode).toMatch(/^zrk-/u);
+		const row = getOverlayBySlug(db, 'alice-run');
+		expect(row.recovery_code_hash).toMatch(/^[0-9a-f]{64}$/u);
+		expect(row.ufvk_fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+		expect(body.recoveryCode).not.toBe(row.recovery_code_hash);
+	});
+
+	test('wallet login lists this wallet\'s pages and issues a working session token', async () => {
+		await createPage(app);
+		await createPage(app, { slug: 'alice-swim', label: 'Alice swims' });
+
+		const miss = await app.inject({
+			method: 'POST', url: '/v1/ziving/wallet/login', payload: { ufvk: `uview1${'z'.repeat(80)}` }
+		});
+		expect(miss.statusCode).toBe(404);
+
+		const res = await app.inject({ method: 'POST', url: '/v1/ziving/wallet/login', payload: { ufvk: UFVK } });
+		expect(res.statusCode).toBe(200);
+		const body = res.json();
+		expect(body.sessionToken).toMatch(/^zses_/u);
+		expect(body.pages.map((p) => p.slug).sort()).toEqual(['alice-run', 'alice-swim']);
+
+		// Session token authorises manage endpoints exactly like the owner token.
+		const feat = await app.inject({
+			method: 'POST',
+			url: '/v1/ziving/page/alice-run/feature',
+			payload: { days: 1 },
+			headers: { 'x-overlay-token': body.sessionToken }
+		});
+		expect(feat.statusCode).toBe(201);
+	});
+
+	test('a bare UFVK no longer rotates the owner token via /recover', async () => {
+		await createPage(app);
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/ziving/page/alice-run/recover',
+			payload: { ufvk: UFVK }
+		});
+		expect(res.statusCode).toBe(403);
+	});
+
+	test('lost-key flow: code → paid quote → claim rotates token + code', async () => {
+		const { applyRecoveryUnlock: unlock, OVERLAY_CONSTANTS: C } = await import('../src/donation-overlay-store.js');
+		const created = (await createPage(app)).json();
+
+		const wrong = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/recover', payload: { recoveryCode: 'zrk-nope-nope-nope' }
+		});
+		expect(wrong.statusCode).toBe(403);
+
+		const start = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/recover', payload: { recoveryCode: created.recoveryCode }
+		});
+		expect(start.statusCode).toBe(201);
+		const quote = start.json();
+		expect(quote.product).toBe('lost_key_unlock');
+		expect(quote.payment.memo).toMatch(/^PGR/u);
+
+		// Claiming before the payment confirms is refused.
+		const early = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/recover/claim', payload: { recoveryCode: created.recoveryCode }
+		});
+		expect(early.statusCode).toBe(402);
+
+		// Simulate the receive-poller settling the unlock payment.
+		const row = getOverlayBySlug(db, 'alice-run');
+		const settled = unlock(db, row.id, { usdCents: C.RECOVERY_UNLOCK_USD_CENTS, nowMs: NOW });
+		expect(settled.ok).toBe(true);
+
+		const claim = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/recover/claim', payload: { recoveryCode: created.recoveryCode }
+		});
+		expect(claim.statusCode).toBe(200);
+		const out = claim.json();
+		expect(out.ownerToken).toBeTruthy();
+		expect(out.ownerToken).not.toBe(created.ownerToken);
+		expect(out.recoveryCode).toMatch(/^zrk-/u);
+		expect(out.recoveryCode).not.toBe(created.recoveryCode);
+
+		// Old owner token is revoked, new one works; old recovery code is retired.
+		const oldTok = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/feature', payload: { days: 1 },
+			headers: { 'x-overlay-token': created.ownerToken }
+		});
+		expect(oldTok.statusCode).toBe(403);
+		const newTok = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/feature', payload: { days: 1 },
+			headers: { 'x-overlay-token': out.ownerToken }
+		});
+		expect(newTok.statusCode).toBe(201);
+		const oldCode = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/recover', payload: { recoveryCode: created.recoveryCode }
+		});
+		expect(oldCode.statusCode).toBe(403);
+	});
+
+	test('owner can rotate the recovery code with the owner token', async () => {
+		const created = (await createPage(app)).json();
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/ziving/page/alice-run/recovery-code',
+			headers: { 'x-overlay-token': created.ownerToken }
+		});
+		expect(res.statusCode).toBe(200);
+		const body = res.json();
+		expect(body.recoveryCode).toMatch(/^zrk-/u);
+		expect(body.recoveryCode).not.toBe(created.recoveryCode);
+
+		const denied = await app.inject({
+			method: 'POST',
+			url: '/v1/ziving/page/alice-run/recovery-code',
+			headers: { 'x-overlay-token': 'wrong' }
+		});
+		expect(denied.statusCode).toBe(403);
 	});
 });

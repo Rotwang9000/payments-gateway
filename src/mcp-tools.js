@@ -752,7 +752,8 @@ export function registerZivingMcpTools(server, opts = {}) {
 			page: 'GET /v1/ziving/page/{slug}',
 			events: 'GET /v1/ziving/page/{slug}/events',
 			feature: 'POST /v1/ziving/page/{slug}/feature (header x-overlay-token)',
-			recover: 'POST /v1/ziving/page/{slug}/recover { ufvk } → new ownerToken',
+			recover: 'POST /v1/ziving/page/{slug}/recover { recoveryCode } → small ZEC quote; pay, then POST …/recover/claim { recoveryCode } → new ownerToken + recoveryCode',
+			walletLogin: 'POST /v1/ziving/wallet/login { ufvk } → page list + manage session token',
 			topup: 'POST /v1/overlay/{overlayId}/topup (header x-overlay-token)',
 			cancel: 'DELETE /v1/overlay/{overlayId} (header x-overlay-token)'
 		},
@@ -905,18 +906,20 @@ export function registerZivingMcpTools(server, opts = {}) {
 	});
 
 	server.registerTool(`${prefix}_ziving_recover`, {
-		title: 'Ziving — recover owner token with UFVK',
-		description: 'Re-present the campaign UFVK (uview1…) to prove ownership and receive a fresh ownerToken. Previous token is revoked. Use when the token was lost; prefer saving the token from create when possible.',
+		title: 'Ziving — lost-key recovery (recovery code + small ZEC payment)',
+		description: 'Start lost-key recovery with the recoveryCode shown once at create: returns a small ZEC quote. After it confirms, call again with claim=true to receive a fresh ownerToken + new recoveryCode. A bare UFVK is NOT accepted — view keys get shared and do not prove ownership.',
 		inputSchema: {
 			slug: z.string().min(3).max(48).describe('Campaign slug.'),
-			ufvk: z.string().min(20).describe('Same Zcash UFVK (uview1…) used when the page was created.')
+			recoveryCode: z.string().min(8).describe('Recovery code from page creation (zrk-…).'),
+			claim: z.boolean().optional().describe('false/omitted: get the unlock payment quote. true: claim the new ownerToken after the payment confirmed.')
 		}
-	}, async ({ slug, ufvk }) => {
-		const out = await restJson('POST', `/v1/ziving/page/${encodeURIComponent(slug)}/recover`, {
-			body: { ufvk }
-		});
+	}, async ({ slug, recoveryCode, claim }) => {
+		const path = claim
+			? `/v1/ziving/page/${encodeURIComponent(slug)}/recover/claim`
+			: `/v1/ziving/page/${encodeURIComponent(slug)}/recover`;
+		const out = await restJson('POST', path, { body: { recoveryCode } });
 		return asContent(out.pointer
-			? { ...out, note: 'POST { ufvk } to recover a new ownerToken.' }
+			? { ...out, note: 'POST { recoveryCode } to start; pay the quote; then claim=true for the new ownerToken.' }
 			: out);
 	});
 

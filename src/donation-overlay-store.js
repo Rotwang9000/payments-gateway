@@ -61,7 +61,13 @@ export const OVERLAY_CONSTANTS = Object.freeze({
 	SLUG_MIN_LEN: 3,
 	SLUG_MAX_LEN: 48,
 	STORY_MAX_LEN: 4000,
-	FEATURED_LIST_MAX: 24
+	FEATURED_LIST_MAX: 24,
+	// Lost-key recovery: the owner pays this much in ZEC (memo quote) to
+	// open a claim window; the recovery code alone never rotates the token.
+	RECOVERY_UNLOCK_USD_CENTS: 50,
+	RECOVERY_UNLOCK_WINDOW_MS: 48 * 3_600_000,
+	// Wallet-login sessions (UFVK match → temporary manage access).
+	SESSION_TTL_MS: 24 * 3_600_000
 });
 
 const SCHEMA = `
@@ -162,6 +168,30 @@ function migrateDonationOverlaySchema(db) {
 	if (!cols.has('goal_zatoshi')) db.exec('ALTER TABLE donation_overlays ADD COLUMN goal_zatoshi TEXT');
 	if (!cols.has('featured_until_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN featured_until_ms INTEGER');
 	if (!cols.has('baseline_height')) db.exec('ALTER TABLE donation_overlays ADD COLUMN baseline_height INTEGER');
+	if (!cols.has('recovery_code_hash')) db.exec('ALTER TABLE donation_overlays ADD COLUMN recovery_code_hash TEXT');
+	if (!cols.has('ufvk_fingerprint')) db.exec('ALTER TABLE donation_overlays ADD COLUMN ufvk_fingerprint TEXT');
+	if (!cols.has('recovery_unlock_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN recovery_unlock_ms INTEGER');
+	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_ufvk_fp ON donation_overlays(ufvk_fingerprint) WHERE ufvk_fingerprint IS NOT NULL');
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS overlay_sessions (
+			token_hash     TEXT NOT NULL,
+			overlay_id     TEXT NOT NULL,
+			created_at_ms  INTEGER NOT NULL,
+			expires_at_ms  INTEGER NOT NULL,
+			PRIMARY KEY (token_hash, overlay_id)
+		)
+	`);
+	db.exec('CREATE INDEX IF NOT EXISTS idx_session_expiry ON overlay_sessions(expires_at_ms)');
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS ziving_recovery_quotes (
+			quote_id       TEXT PRIMARY KEY,
+			overlay_id     TEXT NOT NULL,
+			usd_cents      INTEGER NOT NULL,
+			settled        INTEGER DEFAULT 0,
+			created_at_ms  INTEGER NOT NULL
+		)
+	`);
+	db.exec('CREATE INDEX IF NOT EXISTS idx_recovery_quote_overlay ON ziving_recovery_quotes(overlay_id, settled, usd_cents)');
 	db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_overlay_slug_unique ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_slug ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_featured ON donation_overlays(featured_until_ms) WHERE featured_until_ms IS NOT NULL');
@@ -188,6 +218,35 @@ export function genOverlayOwnerToken() {
 	return randomBytes(24).toString('base64url');
 }
 
+/** Wallet-login session bearer token (short-lived, hash stored). */
+export function genOverlaySessionToken() {
+	return `zses_${randomBytes(24).toString('base64url')}`;
+}
+
+// Human-typable alphabet: lowercase Crockford-ish, no 0/1/i/l/o/u.
+const RECOVERY_ALPHABET = '23456789abcdefghjkmnpqrstvwxyz';
+
+/** Lost-key recovery code, e.g. "zrk-h7f2-p9wm-3kdt" (~59 bits). */
+export function genOverlayRecoveryCode() {
+	const bytes = randomBytes(12);
+	let out = 'zrk';
+	for (let i = 0; i < 12; i += 1) {
+		if (i % 4 === 0) out += '-';
+		out += RECOVERY_ALPHABET[bytes[i] % RECOVERY_ALPHABET.length];
+	}
+	return out;
+}
+
+/** Canonical form for recovery-code comparison (paste-tolerant). */
+export function normaliseRecoveryCode(code) {
+	return String(code ?? '').toLowerCase().replace(/[^a-z0-9]/gu, '');
+}
+
+/** Deterministic UFVK lookup key — sha256 hex of the trimmed key text. */
+export function ufvkFingerprint(ufvk) {
+	return createHash('sha256').update(String(ufvk ?? '').trim(), 'utf8').digest('hex');
+}
+
 /**
  * Create an overlay. `ufvkCiphertext` is the already-encrypted UFVK.
  * Returns { id, ownerToken, expiresAt } — only the token HASH is stored.
@@ -202,6 +261,8 @@ export function createOverlay(db, {
 	slug = null,
 	story = null,
 	goalZatoshi = null,
+	recoveryCodeHash = null,
+	ufvkFingerprintHex = null,
 	creditAtomic = OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC,
 	dayRateAtomic = OVERLAY_CONSTANTS.DAY_RATE_ATOMIC,
 	nowMs = Date.now()
@@ -224,10 +285,10 @@ export function createOverlay(db, {
 	db.prepare(`
 		INSERT INTO donation_overlays
 			(id, owner_token_hash, chain, address, ufvk_ct, birthday_height, baseline_height, label, min_zatoshi,
-			 slug, story, goal_zatoshi,
+			 slug, story, goal_zatoshi, recovery_code_hash, ufvk_fingerprint,
 			 created_at_ms, expires_at_ms, credit_atomic, credit_topups_atomic, credit_last_billed_ms)
 		VALUES (@id, @hash, 'zcash', @address, @ufvkCt, @birthday, @baseline, @label, @minZat,
-		        @slug, @story, @goalZat,
+		        @slug, @story, @goalZat, @recoveryHash, @ufvkFp,
 		        @now, @expires, @credit, @credit, @now)
 	`).run({
 		id,
@@ -241,6 +302,8 @@ export function createOverlay(db, {
 		slug: slug ?? null,
 		story: story ?? null,
 		goalZat: goalZatoshi != null ? String(goalZatoshi) : null,
+		recoveryHash: recoveryCodeHash ?? null,
+		ufvkFp: ufvkFingerprintHex ?? null,
 		now: nowMs,
 		expires: expiresAt,
 		credit: creditAtomic
@@ -360,16 +423,138 @@ export function listRecentCampaignDonations(db, { limit = 12 } = {}) {
 }
 
 /**
- * Fetch an overlay gated by the owner token (constant-time compare).
+ * Fetch an overlay gated by the owner token (constant-time compare) or a
+ * live wallet-login session token for the same overlay.
  * Returns the row, { error: 'not_found' }, or { error: 'forbidden' }.
  */
-export function getOverlayAuthorised(db, id, ownerToken) {
+export function getOverlayAuthorised(db, id, ownerToken, { nowMs = Date.now() } = {}) {
 	const row = getOverlay(db, id);
 	if (!row) return { error: 'not_found' };
-	if (typeof ownerToken !== 'string' || !safeEqualHex(hashToken(ownerToken), row.owner_token_hash)) {
-		return { error: 'forbidden' };
+	if (typeof ownerToken !== 'string' || ownerToken.length === 0) return { error: 'forbidden' };
+	if (safeEqualHex(hashToken(ownerToken), row.owner_token_hash)) return row;
+	const session = db.prepare(`
+		SELECT 1 FROM overlay_sessions
+		WHERE token_hash = ? AND overlay_id = ? AND expires_at_ms > ?
+	`).get(hashToken(ownerToken), id, nowMs);
+	return session ? row : { error: 'forbidden' };
+}
+
+/**
+ * Issue a wallet-login session covering `overlayIds`. Returns the plaintext
+ * token (shown once); only the hash is stored. Expired sessions are pruned
+ * opportunistically here.
+ */
+export function createOverlaySession(db, overlayIds, {
+	nowMs = Date.now(),
+	ttlMs = OVERLAY_CONSTANTS.SESSION_TTL_MS
+} = {}) {
+	const ids = (overlayIds ?? []).filter((v) => typeof v === 'string' && v.length > 0);
+	if (ids.length === 0) throw new TypeError('createOverlaySession: at least one overlay id required');
+	db.prepare('DELETE FROM overlay_sessions WHERE expires_at_ms <= ?').run(nowMs);
+	const token = genOverlaySessionToken();
+	const expiresAtMs = nowMs + ttlMs;
+	const insert = db.prepare(`
+		INSERT INTO overlay_sessions (token_hash, overlay_id, created_at_ms, expires_at_ms)
+		VALUES (?, ?, ?, ?)
+	`);
+	const hash = hashToken(token);
+	for (const id of ids) insert.run(hash, id, nowMs, expiresAtMs);
+	return { token, expiresAtMs, overlayIds: ids };
+}
+
+/**
+ * All overlays owned by a UFVK. Fast path is the stored fingerprint;
+ * pre-migration rows (NULL fingerprint) fall back to decrypt-and-compare
+ * and are backfilled on match so the next login is indexed.
+ */
+export function findOverlaysByUfvk(db, presentedUfvk, decryptViewKey) {
+	const ufvk = typeof presentedUfvk === 'string' ? presentedUfvk.trim() : '';
+	if (!ufvk.startsWith('uview')) return [];
+	const fp = ufvkFingerprint(ufvk);
+	const matched = db.prepare('SELECT * FROM donation_overlays WHERE ufvk_fingerprint = ?').all(fp);
+	if (typeof decryptViewKey === 'function') {
+		const legacy = db.prepare('SELECT * FROM donation_overlays WHERE ufvk_fingerprint IS NULL AND cancelled = 0').all();
+		for (const row of legacy) {
+			let stored;
+			try { stored = decryptViewKey(row.ufvk_ct); } catch { continue; }
+			if (safeEqualUtf8(stored, ufvk)) {
+				db.prepare('UPDATE donation_overlays SET ufvk_fingerprint = ? WHERE id = ?').run(fp, row.id);
+				matched.push({ ...row, ufvk_fingerprint: fp });
+			}
+		}
 	}
-	return row;
+	return matched;
+}
+
+/** Store a (new) recovery-code hash. Overwrites any previous code. */
+export function setOverlayRecoveryCode(db, id, { code = genOverlayRecoveryCode() } = {}) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	db.prepare('UPDATE donation_overlays SET recovery_code_hash = ? WHERE id = ?')
+		.run(hashToken(normaliseRecoveryCode(code)), id);
+	return { ok: true, recoveryCode: code };
+}
+
+/** Constant-time recovery-code check against the stored hash. */
+export function verifyOverlayRecoveryCode(row, code) {
+	if (!row?.recovery_code_hash) return false;
+	const normalised = normaliseRecoveryCode(code);
+	if (normalised.length === 0) return false;
+	return safeEqualHex(hashToken(normalised), row.recovery_code_hash);
+}
+
+/** Record a pending lost-key unlock purchase (settled by the receive-poller). */
+export function createRecoveryQuoteRow(db, { quoteId, overlayId, usdCents, nowMs = Date.now() }) {
+	if (typeof quoteId !== 'string' || !quoteId) throw new TypeError('createRecoveryQuoteRow: quoteId required');
+	if (typeof overlayId !== 'string' || !overlayId) throw new TypeError('createRecoveryQuoteRow: overlayId required');
+	if (!Number.isInteger(usdCents) || usdCents <= 0) throw new TypeError('createRecoveryQuoteRow: usdCents required');
+	db.prepare(`
+		INSERT INTO ziving_recovery_quotes (quote_id, overlay_id, usd_cents, settled, created_at_ms)
+		VALUES (?, ?, ?, 0, ?)
+	`).run(quoteId, overlayId, usdCents, nowMs);
+	return { quoteId, overlayId, usdCents };
+}
+
+/**
+ * Settle a lost-key unlock payment: open the claim window on the overlay.
+ * Mirrors applyFeaturePurchase's pending-row-by-cents dispatch.
+ */
+export function applyRecoveryUnlock(db, overlayId, {
+	usdCents,
+	windowMs = OVERLAY_CONSTANTS.RECOVERY_UNLOCK_WINDOW_MS,
+	nowMs = Date.now()
+}) {
+	const pending = db.prepare(`
+		SELECT * FROM ziving_recovery_quotes
+		WHERE overlay_id = ? AND usd_cents = ? AND settled = 0
+		ORDER BY created_at_ms DESC
+		LIMIT 1
+	`).get(overlayId, usdCents);
+	if (!pending) return { ok: false, reason: 'no_pending_recovery' };
+	const row = getOverlay(db, overlayId);
+	if (!row) return { ok: false, reason: 'not_found' };
+	if (row.cancelled === 1) return { ok: false, reason: 'cancelled' };
+	const unlockUntilMs = nowMs + windowMs;
+	db.prepare('UPDATE donation_overlays SET recovery_unlock_ms = ? WHERE id = ?').run(unlockUntilMs, overlayId);
+	db.prepare('UPDATE ziving_recovery_quotes SET settled = 1 WHERE quote_id = ?').run(pending.quote_id);
+	return { ok: true, unlockUntilMs };
+}
+
+/**
+ * Claim a paid lost-key recovery: inside the unlock window, rotate the
+ * owner token AND the recovery code (both returned once), close the window.
+ */
+export function claimOverlayRecovery(db, id, { nowMs = Date.now() } = {}) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	if (row.cancelled === 1) return { ok: false, reason: 'cancelled' };
+	if (!(Number(row.recovery_unlock_ms) > nowMs)) return { ok: false, reason: 'not_unlocked' };
+	const rotated = rotateOverlayOwnerToken(db, id);
+	if (!rotated.ok) return rotated;
+	const recoveryCode = genOverlayRecoveryCode();
+	db.prepare('UPDATE donation_overlays SET recovery_code_hash = ?, recovery_unlock_ms = NULL WHERE id = ?')
+		.run(hashToken(normaliseRecoveryCode(recoveryCode)), id);
+	return { ok: true, ownerToken: rotated.ownerToken, recoveryCode, id: row.id, slug: row.slug ?? null };
 }
 
 /**

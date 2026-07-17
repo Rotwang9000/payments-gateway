@@ -166,7 +166,16 @@ export {
 	pruneOverlayData,
 	overlayStatsSnapshot,
 	rotateOverlayOwnerToken,
-	recoverOverlayOwnerByUfvk
+	recoverOverlayOwnerByUfvk,
+	genOverlayRecoveryCode,
+	setOverlayRecoveryCode,
+	verifyOverlayRecoveryCode,
+	claimOverlayRecovery,
+	applyRecoveryUnlock,
+	createRecoveryQuoteRow,
+	findOverlaysByUfvk,
+	createOverlaySession,
+	ufvkFingerprint
 } from './donation-overlay-store.js';
 
 export {
