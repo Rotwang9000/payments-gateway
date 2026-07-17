@@ -210,6 +210,27 @@ function migrateDonationOverlaySchema(db) {
 	db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_overlay_slug_unique ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_slug ON donation_overlays(slug) WHERE slug IS NOT NULL');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_featured ON donation_overlays(featured_until_ms) WHERE featured_until_ms IS NOT NULL');
+	// One live campaign/overlay per wallet: the UFVK scanner returns every
+	// note for that view key, so two non-cancelled rows would double-count
+	// (and mis-attribute) the same gifts. Cancelled pages may reuse the key.
+	try {
+		db.exec(`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_overlay_one_live_ufvk
+				ON donation_overlays(ufvk_fingerprint)
+				WHERE cancelled = 0 AND ufvk_fingerprint IS NOT NULL
+		`);
+	} catch {
+		/* Existing duplicate live fingerprints block the index; app-level check still enforces. */
+	}
+	try {
+		db.exec(`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_overlay_one_live_address
+				ON donation_overlays(address)
+				WHERE cancelled = 0
+		`);
+	} catch {
+		/* Same: duplicates may exist from before this rule. */
+	}
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS ziving_feature_quotes (
 			quote_id       TEXT PRIMARY KEY,
@@ -263,8 +284,58 @@ export function ufvkFingerprint(ufvk) {
 }
 
 /**
+ * Non-cancelled overlay already using this UFVK fingerprint, if any.
+ * Scanner notes are per-UFVK, so only one live page may own a given key.
+ */
+export function findLiveOverlayByUfvkFingerprint(db, fingerprintHex) {
+	if (typeof fingerprintHex !== 'string' || fingerprintHex.length === 0) return null;
+	return db.prepare(`
+		SELECT * FROM donation_overlays
+		WHERE ufvk_fingerprint = ? AND cancelled = 0
+		ORDER BY created_at_ms DESC
+		LIMIT 1
+	`).get(fingerprintHex) ?? null;
+}
+
+/** Non-cancelled overlay already registered on this receive address. */
+export function findLiveOverlayByAddress(db, address) {
+	if (typeof address !== 'string' || address.length === 0) return null;
+	return db.prepare(`
+		SELECT * FROM donation_overlays
+		WHERE address = ? AND cancelled = 0
+		ORDER BY created_at_ms DESC
+		LIMIT 1
+	`).get(address) ?? null;
+}
+
+/**
+ * Throw if this wallet/address already has a live page.
+ * Attaches `.code = 'wallet_already_has_page'` and existing slug/id for API 409s.
+ */
+export function assertWalletAvailableForOverlay(db, { address, ufvkFingerprintHex = null } = {}) {
+	const byFp = ufvkFingerprintHex
+		? findLiveOverlayByUfvkFingerprint(db, ufvkFingerprintHex)
+		: null;
+	const byAddr = findLiveOverlayByAddress(db, address);
+	const existing = byFp ?? byAddr;
+	if (!existing) return;
+	const err = new Error(
+		existing.slug
+			? `This wallet already has an active page ("${existing.slug}"). Cancel it on Manage before creating another.`
+			: 'This wallet already has an active overlay. Cancel it before creating another.'
+	);
+	err.code = 'wallet_already_has_page';
+	err.existingSlug = existing.slug ?? null;
+	err.existingOverlayId = existing.id;
+	throw err;
+}
+
+/**
  * Create an overlay. `ufvkCiphertext` is the already-encrypted UFVK.
  * Returns { id, ownerToken, expiresAt } — only the token HASH is stored.
+ *
+ * At most one non-cancelled overlay may share a UFVK fingerprint or receive
+ * address (donations cannot be attributed across multiple pages otherwise).
  */
 export function createOverlay(db, {
 	address,
@@ -291,6 +362,7 @@ export function createOverlay(db, {
 	if (!Number.isInteger(creditAtomic) || creditAtomic <= 0) {
 		throw new TypeError('createOverlay: creditAtomic must be a positive integer');
 	}
+	assertWalletAvailableForOverlay(db, { address, ufvkFingerprintHex });
 	const id = genOverlayId();
 	const ownerToken = genOverlayOwnerToken();
 	const expiresAt = Math.min(
@@ -498,13 +570,19 @@ export function findOverlaysByUfvk(db, presentedUfvk, decryptViewKey) {
 	const matched = db.prepare('SELECT * FROM donation_overlays WHERE ufvk_fingerprint = ?').all(fp);
 	if (typeof decryptViewKey === 'function') {
 		const legacy = db.prepare('SELECT * FROM donation_overlays WHERE ufvk_fingerprint IS NULL AND cancelled = 0').all();
+		const liveOwner = findLiveOverlayByUfvkFingerprint(db, fp);
 		for (const row of legacy) {
 			let stored;
 			try { stored = decryptViewKey(row.ufvk_ct); } catch { continue; }
-			if (safeEqualUtf8(stored, ufvk)) {
-				db.prepare('UPDATE donation_overlays SET ufvk_fingerprint = ? WHERE id = ?').run(fp, row.id);
-				matched.push({ ...row, ufvk_fingerprint: fp });
+			if (!safeEqualUtf8(stored, ufvk)) continue;
+			// Do not stamp the fingerprint onto a second live row — unique
+			// index / one-page-per-wallet rule. Still return it for login.
+			if (liveOwner && liveOwner.id !== row.id) {
+				matched.push(row);
+				continue;
 			}
+			db.prepare('UPDATE donation_overlays SET ufvk_fingerprint = ? WHERE id = ?').run(fp, row.id);
+			matched.push({ ...row, ufvk_fingerprint: fp });
 		}
 	}
 	return matched;

@@ -39,7 +39,8 @@ import {
 	getOverlayAuthorised,
 	cancelOverlay,
 	listEventsSince,
-	overlayStatsSnapshot
+	overlayStatsSnapshot,
+	ufvkFingerprint
 } from './donation-overlay-store.js';
 import { OVERLAY_CONFIRMATIONS_DEFAULT } from './donation-overlay-poller.js';
 
@@ -264,14 +265,38 @@ export function registerDonationOverlayRoutes(app, deps) {
 			return reply.code(503).send({ error: { code: 'price_unavailable', message: 'could not fetch a live exchange rate; please retry shortly' } });
 		}
 
-		const created = createOverlay(watchDb, {
-			address: input.address,
-			ufvkCiphertext: encryptViewKey(input.ufvk),
-			birthdayHeight: input.birthdayHeight,
-			label: input.label,
-			minZatoshi: input.minZatoshi,
-			nowMs: now()
-		});
+		let created;
+		try {
+			created = createOverlay(watchDb, {
+				address: input.address,
+				ufvkCiphertext: encryptViewKey(input.ufvk),
+				birthdayHeight: input.birthdayHeight,
+				label: input.label,
+				minZatoshi: input.minZatoshi,
+				ufvkFingerprintHex: ufvkFingerprint(input.ufvk),
+				nowMs: now()
+			});
+		} catch (err) {
+			if (err?.code === 'wallet_already_has_page') {
+				return reply.code(409).send({
+					error: {
+						code: 'wallet_already_has_page',
+						message: err.message,
+						existingOverlayId: err.existingOverlayId ?? null
+					}
+				});
+			}
+			const msg = String(err?.message ?? '');
+			if (msg.includes('UNIQUE constraint failed') && /ufvk_fingerprint|one_live_ufvk|one_live_address|\.address/i.test(msg)) {
+				return reply.code(409).send({
+					error: {
+						code: 'wallet_already_has_page',
+						message: 'This wallet already has an active overlay. Cancel it before creating another.'
+					}
+				});
+			}
+			throw err;
+		}
 
 		// Funding quote: same store as watch top-ups; watch_id carries
 		// the overlay id, the owner token stands in for the watch token.

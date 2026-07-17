@@ -43,9 +43,12 @@ function openDb() {
 	return db;
 }
 
+let overlayAddrSeq = 0;
+
 function makeOverlay(db, over = {}) {
+	overlayAddrSeq += 1;
 	return createOverlay(db, {
-		address: 'u1streameraddress',
+		address: `u1streameraddress${overlayAddrSeq}`,
 		ufvkCiphertext: 'ct:sealed-ufvk',
 		label: 'Test Streamer',
 		nowMs: NOW,
@@ -277,7 +280,10 @@ describe('recovery codes, UFVK fingerprint lookup, wallet sessions', () => {
 	test('findOverlaysByUfvk matches by fingerprint and backfills legacy rows', () => {
 		const ufvk = 'uview1alice-secret-key';
 		const withFp = makeOverlay(db, { slug: 'new-page', ufvkFingerprintHex: ufvkFingerprint(ufvk) });
-		// Legacy row: no fingerprint, invertible stub crypto.
+		// Cancel so a second live row with the same UFVK is allowed only as
+		// a legacy NULL-fingerprint row for backfill testing — one live page
+		// per wallet is otherwise enforced.
+		expect(cancelOverlay(db, withFp.id, withFp.ownerToken).ok).toBe(true);
 		const legacy = makeOverlay(db, { slug: 'old-page', ufvkCiphertext: `sealed:${ufvk}` });
 		const decrypt = (ct) => String(ct).replace(/^sealed:/u, '');
 		const found = findOverlaysByUfvk(db, ufvk, decrypt);
@@ -288,6 +294,24 @@ describe('recovery codes, UFVK fingerprint lookup, wallet sessions', () => {
 			.toEqual([withFp.id, legacy.id].sort());
 		expect(findOverlaysByUfvk(db, 'uview1someone-else', decrypt)).toHaveLength(0);
 		expect(findOverlaysByUfvk(db, 'not-a-ufvk', decrypt)).toHaveLength(0);
+	});
+
+	test('one live page per UFVK fingerprint; cancelled pages free the wallet', () => {
+		const ufvk = 'uview1one-wallet-rule';
+		const fp = ufvkFingerprint(ufvk);
+		const first = makeOverlay(db, { slug: 'page-one', ufvkFingerprintHex: fp });
+		expect(() => makeOverlay(db, { slug: 'page-two', ufvkFingerprintHex: fp }))
+			.toThrow(/already has an active/);
+		expect(cancelOverlay(db, first.id, first.ownerToken).ok).toBe(true);
+		const second = makeOverlay(db, { slug: 'page-two', ufvkFingerprintHex: fp });
+		expect(second.id).not.toBe(first.id);
+	});
+
+	test('one live page per receive address', () => {
+		const addr = 'u1shared-receive-address';
+		makeOverlay(db, { slug: 'addr-a', address: addr });
+		expect(() => makeOverlay(db, { slug: 'addr-b', address: addr }))
+			.toThrow(/already has an active/);
 	});
 
 	test('wallet sessions authorise like the owner token until they expire', () => {

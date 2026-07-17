@@ -174,6 +174,9 @@ export {
 	applyRecoveryUnlock,
 	createRecoveryQuoteRow,
 	findOverlaysByUfvk,
+	findLiveOverlayByUfvkFingerprint,
+	findLiveOverlayByAddress,
+	assertWalletAvailableForOverlay,
 	createOverlaySession,
 	ufvkFingerprint
 } from './donation-overlay-store.js';

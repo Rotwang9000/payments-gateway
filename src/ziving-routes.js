@@ -336,7 +336,26 @@ export function registerZivingRoutes(app, deps) {
 				nowMs: now()
 			});
 		} catch (err) {
-			if (String(err?.message ?? '').includes('UNIQUE constraint failed')) {
+			if (err?.code === 'wallet_already_has_page') {
+				return reply.code(409).send({
+					error: {
+						code: 'wallet_already_has_page',
+						message: err.message,
+						existingSlug: err.existingSlug ?? null,
+						existingOverlayId: err.existingOverlayId ?? null
+					}
+				});
+			}
+			const msg = String(err?.message ?? '');
+			if (msg.includes('UNIQUE constraint failed')) {
+				if (/ufvk_fingerprint|one_live_ufvk|one_live_address|\.address/i.test(msg)) {
+					return reply.code(409).send({
+						error: {
+							code: 'wallet_already_has_page',
+							message: 'This wallet already has an active page. Cancel it on Manage before creating another.'
+						}
+					});
+				}
 				return reply.code(409).send({ error: { code: 'slug_taken', message: `slug "${input.slug}" is already in use` } });
 			}
 			throw err;

@@ -10,7 +10,8 @@ import { registerZivingRoutes, validateZivingPageRequest } from '../src/ziving-r
 import {
 	ensureDonationOverlaySchema,
 	getOverlayBySlug,
-	recordDonationEvent
+	recordDonationEvent,
+	cancelOverlay
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -224,6 +225,15 @@ describe('ziving routes', () => {
 		expect(res.json().error.code).toBe('slug_taken');
 	});
 
+	test('same wallet different slug returns 409 wallet_already_has_page', async () => {
+		const first = await createPage(app, { slug: 'alice-run' });
+		expect(first.statusCode).toBe(201);
+		const res = await createPage(app, { slug: 'bob-cause' });
+		expect(res.statusCode).toBe(409);
+		expect(res.json().error.code).toBe('wallet_already_has_page');
+		expect(res.json().error.existingSlug).toBe('alice-run');
+	});
+
 	test('unknown slug returns 404', async () => {
 		const res = await app.inject({ method: 'GET', url: '/v1/ziving/page/nobody-here' });
 		expect(res.statusCode).toBe(404);
@@ -300,8 +310,13 @@ describe('ziving auth: recovery codes, wallet login, paid lost-key recovery', ()
 	});
 
 	test('wallet login lists this wallet\'s pages and issues a working session token', async () => {
-		await createPage(app);
-		await createPage(app, { slug: 'alice-swim', label: 'Alice swims' });
+		const first = await createPage(app);
+		expect(first.statusCode).toBe(201);
+		const { overlayId, ownerToken } = first.json();
+		// One live page per wallet: cancel before creating another with the same UFVK.
+		expect(cancelOverlay(db, overlayId, ownerToken).ok).toBe(true);
+		const second = await createPage(app, { slug: 'alice-swim', label: 'Alice swims' });
+		expect(second.statusCode).toBe(201);
 
 		const miss = await app.inject({
 			method: 'POST', url: '/v1/ziving/wallet/login', payload: { ufvk: `uview1${'z'.repeat(80)}` }
@@ -314,10 +329,10 @@ describe('ziving auth: recovery codes, wallet login, paid lost-key recovery', ()
 		expect(body.sessionToken).toMatch(/^zses_/u);
 		expect(body.pages.map((p) => p.slug).sort()).toEqual(['alice-run', 'alice-swim']);
 
-		// Session token authorises manage endpoints exactly like the owner token.
+		// Session token authorises manage on the live page.
 		const feat = await app.inject({
 			method: 'POST',
-			url: '/v1/ziving/page/alice-run/feature',
+			url: '/v1/ziving/page/alice-swim/feature',
 			payload: { days: 1 },
 			headers: { 'x-overlay-token': body.sessionToken }
 		});
