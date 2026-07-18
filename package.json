@@ -1,6 +1,6 @@
 {
 	"name": "payments-gateway",
-	"version": "0.13.3",
+	"version": "0.13.4",
 	"description": "Generic MCP + REST payments gateway. Charge for any service two ways: direct payment with confirmation (x402 USDC per-call; co-signed outbound ZEC where a human approves each spend) or top-up & use (prepaid credit meters fed by x402 or native XMR/ZEC payments, watched via view keys only). Embed it in your own server or run it standalone for your agents. Built on x402-server-kit + viewkey-watch.",
 	"type": "module",
 	"license": "MIT",
