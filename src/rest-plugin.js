@@ -235,19 +235,20 @@ export function registerGatewayRoutes(app, opts = {}) {
 		});
 	}
 
-	// Privacy-coin (XMR/ZEC) credit top-up config — shared by /v1/private/info
-	// and the route registration. Inert per chain until the receiving address
-	// is set, so safe to register unconditionally.
+	// Privacy-coin (XMR/ZEC/shielded DASH) credit top-up config — shared by
+	// /v1/private/info and the route registration. Inert per chain until the
+	// receiving address is set, so safe to register unconditionally.
 	const cryptoRecvAddresses = opts.cryptoRecvAddresses ?? {
 		monero: config.xmrRecvAddress,
-		zcash: config.zecRecvAddress
+		zcash: config.zecRecvAddress,
+		dash: config.dashRecvAddress
 	};
 	const cryptoPriceOracle = opts.cryptoPriceOracle ?? createPriceOracle({
 		url: config.cryptoPriceUrl,
 		timeoutMs: config.cryptoPriceTimeoutMs,
 		cacheTtlMs: config.cryptoPriceCacheTtlMs,
 		fetchImpl: opts.fetchImpl ?? globalThis.fetch,
-		fallback: { monero: config.xmrUsdFallback, zcash: config.zecUsdFallback }
+		fallback: { monero: config.xmrUsdFallback, zcash: config.zecUsdFallback, dash: config.dashUsdFallback }
 	});
 	const cryptoTopupPolicy = {
 		minUsdCents: config.cryptoTopupMinUsdCents,
@@ -256,10 +257,11 @@ export function registerGatewayRoutes(app, opts = {}) {
 		quoteTtlSec: config.cryptoTopupQuoteTtlSec,
 		confirmations: {
 			monero: config.cryptoTopupXmrConfirmations,
-			zcash: config.cryptoTopupZecConfirmations
+			zcash: config.cryptoTopupZecConfirmations,
+			dash: config.cryptoTopupDashConfirmations
 		}
 	};
-	const cryptoAcceptedChains = () => ['monero', 'zcash'].filter(
+	const cryptoAcceptedChains = () => ['monero', 'zcash', 'dash'].filter(
 		(c) => typeof cryptoRecvAddresses[c] === 'string' && cryptoRecvAddresses[c].length > 0
 	);
 

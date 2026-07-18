@@ -29,7 +29,10 @@ import { getWatch as storeGetWatch } from 'viewkey-watch/private-watch-store';
 import { usdCentsToCoinAtomic, formatCoinAmount } from 'viewkey-watch/crypto-price';
 
 const UUID_RE = /^[0-9a-fA-F-]{36}$/u;
-const SUPPORTED_CHAINS = Object.freeze(['monero', 'zcash']);
+const SUPPORTED_CHAINS = Object.freeze(['monero', 'zcash', 'dash']);
+
+/** Display ticker per payment chain (dash = shielded DASH on Evolution). */
+const COIN_TICKER = Object.freeze({ monero: 'XMR', zcash: 'ZEC', dash: 'DASH' });
 
 // Default attribution prefix for Zcash memos. Brand-neutral; a host can
 // override per-deployment via the `memoPrefix` dep (e.g. Seneschal passes
@@ -113,6 +116,9 @@ export function buildInstructions(row, confirmationsRequired) {
 	if (row.chain === 'monero') {
 		return `Send EXACTLY ${display} XMR to ${row.recv_address} before the quote expires. The amount's final digits are your invoice tag — send the exact amount or we can't match it. ${credit} of credit lands after ${confirmationsRequired} confirmations.`;
 	}
+	if (row.chain === 'dash') {
+		return `Send ${display} shielded DASH (Dash Evolution Orchard pool) to ${row.recv_address} and include the memo "${row.memo}" before the quote expires. Platform transfers are final in ~1 second — ${credit} of credit lands on the next poll after your payment.`;
+	}
 	return `Send ${display} ZEC to ${row.recv_address} and include the memo "${row.memo}" before the quote expires. ${credit} of credit lands after ${confirmationsRequired} confirmations.`;
 }
 
@@ -125,7 +131,7 @@ export function publicQuote(row, { confirmationsRequired }) {
 		payTo: row.recv_address,
 		memo: row.memo ?? null,
 		amount: {
-			coin: row.chain === 'monero' ? 'XMR' : 'ZEC',
+			coin: COIN_TICKER[row.chain] ?? row.chain.toUpperCase(),
 			atomic: String(row.expected_atomic),
 			display: formatCoinAmount(BigInt(row.expected_atomic), row.chain)
 		},

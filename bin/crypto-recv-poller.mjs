@@ -12,7 +12,10 @@
 //
 // A chain is only polled when BOTH its receive address and view key are
 // set:  XMR_RECV_ADDRESS + XMR_RECV_VIEW_KEY,
-//       ZEC_RECV_ADDRESS + ZEC_RECV_UFVK.
+//       ZEC_RECV_ADDRESS + ZEC_RECV_UFVK,
+//       DASH_RECV_ADDRESS + DASH_RECV_FVK (needs viewkey-watch >= 0.2.0
+//       and @dashevo/evo-sdk; scans the Platform Orchard note stream
+//       in-process — no NFPT, no birthday, settles next tick).
 // (Legacy SENESCHAL_* names are still accepted via config.js fallbacks.)
 
 import config from '../src/config.js';
@@ -51,6 +54,7 @@ function configuredChains() {
 	const chains = [];
 	if (config.xmrRecvAddress && config.xmrRecvViewKey) chains.push('monero');
 	if (config.zecRecvAddress && config.zecRecvUfvk) chains.push('zcash');
+	if (config.dashRecvAddress && config.dashRecvFvk) chains.push('dash');
 	return chains;
 }
 
@@ -74,6 +78,17 @@ function makeScan(nfptClient) {
 				viewKey: config.xmrRecvViewKey,
 				fromHeight: config.xmrRecvFromHeight > 0 ? config.xmrRecvFromHeight : undefined,
 				pollIntervalMs: NFPT_POLL_INTERVAL_MS
+			});
+		}
+		if (chain === 'dash') {
+			// Dash Evolution Orchard: no NFPT — the flat Platform note
+			// stream is trial-decrypted in-process (viewkey-watch >= 0.2.0
+			// + @dashevo/evo-sdk). Lazy import so hosts on an older
+			// viewkey-watch pin run unchanged until dash is configured.
+			const { scanDashReceiving } = await import('viewkey-watch/dash-orchard-scan');
+			return scanDashReceiving({
+				fvk: config.dashRecvFvk,
+				startIndex: config.dashRecvFromIndex > 0 ? config.dashRecvFromIndex : 0
 			});
 		}
 		return scanReceiving(nfptClient, {
@@ -117,7 +132,8 @@ async function main() {
 	const scan = memoiseScan(makeScan(nfptClient));
 	const confirmations = {
 		monero: config.cryptoTopupXmrConfirmations,
-		zcash: config.cryptoTopupZecConfirmations
+		zcash: config.cryptoTopupZecConfirmations,
+		dash: config.cryptoTopupDashConfirmations
 	};
 	// Credit applier: watches first, then donation overlays (their
 	// funding quotes share crypto_topup_quotes with the overlay id in

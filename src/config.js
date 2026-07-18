@@ -285,6 +285,15 @@ export function buildConfig(env = process.env) {
 		zecRecvAddress: asString(env, ['ZEC_RECV_ADDRESS', 'SENESCHAL_ZEC_RECV_ADDRESS'], ''),
 		zecRecvUfvk: asString(env, ['ZEC_RECV_UFVK', 'SENESCHAL_ZEC_RECV_UFVK'], ''),
 		zecRecvBirthdayHeight: asInt(env, ['ZEC_RECV_BIRTHDAY_HEIGHT', 'SENESCHAL_ZEC_RECV_BIRTHDAY_HEIGHT'], 0),
+		// Dash Evolution (Platform) Orchard shielded top-ups. The address
+		// is the dash1z… Bech32m form of the FVK's default address; the
+		// FVK scans Platform's flat note stream (no birthday height —
+		// FROM_INDEX is a stream cursor, 0 = whole stream, fine while
+		// the pool is young). Needs viewkey-watch >= 0.2.0 and
+		// @dashevo/evo-sdk installed to activate.
+		dashRecvAddress: asString(env, 'DASH_RECV_ADDRESS', ''),
+		dashRecvFvk: asString(env, 'DASH_RECV_FVK', ''),
+		dashRecvFromIndex: asInt(env, 'DASH_RECV_FROM_INDEX', 0),
 		cryptoTopupMinUsdCents: asInt(env, 'CRYPTO_TOPUP_MIN_USD_CENTS', 200),
 		cryptoTopupMaxUsdCents: asInt(env, 'CRYPTO_TOPUP_MAX_USD_CENTS', 50_000),
 		cryptoTopupSpreadBps: asInt(env, 'CRYPTO_TOPUP_SPREAD_BPS', 400),
@@ -298,6 +307,9 @@ export function buildConfig(env = process.env) {
 		cryptoTopupMatchGraceMs: asInt(env, 'CRYPTO_TOPUP_MATCH_GRACE_MS', 7 * 86_400_000),
 		cryptoTopupXmrConfirmations: asInt(env, 'CRYPTO_TOPUP_XMR_CONFIRMATIONS', 10),
 		cryptoTopupZecConfirmations: asInt(env, 'CRYPTO_TOPUP_ZEC_CONFIRMATIONS', 8),
+		// Platform notes are final on arrival (1s finality) — 1 means
+		// "settle the tick it is seen".
+		cryptoTopupDashConfirmations: asInt(env, 'CRYPTO_TOPUP_DASH_CONFIRMATIONS', 1),
 		cryptoRecvPollIntervalSec: asInt(env, 'CRYPTO_RECV_POLL_INTERVAL_SEC', 60),
 		// Per-tick cap on waiting for the NFPT receive-wallet scan. The old
 		// library default (2 min) was shorter than a cold scan could ever
@@ -314,6 +326,7 @@ export function buildConfig(env = process.env) {
 		cryptoPriceTimeoutMs: asInt(env, 'CRYPTO_PRICE_TIMEOUT_MS', 5_000),
 		xmrUsdFallback: asInt(env, 'XMR_USD_FALLBACK', 0),
 		zecUsdFallback: asInt(env, 'ZEC_USD_FALLBACK', 0),
+		dashUsdFallback: asInt(env, 'DASH_USD_FALLBACK', 0),
 
 		// ── Make payments (outbound co-signed ZEC via a .wult share) ──
 		// The gateway holds ONE FROST share; every send needs a human to
