@@ -17,6 +17,9 @@
 //   POST /v1/ziving/page/:slug/recover      recovery code → small ZEC quote (opens claim window)
 //   POST /v1/ziving/page/:slug/recover/claim paid + code → fresh ownerToken + recovery code
 //   POST /v1/ziving/page/:slug/recovery-code owner/session token → rotate recovery code
+//   POST /v1/ziving/page/:slug/x-link/start  owner/session token → get a code to post on X
+//   POST /v1/ziving/page/:slug/x-link/verify owner/session token → verify the posted tweet
+//   DELETE /v1/ziving/page/:slug/x-link      owner/session token → unlink X account
 //
 // Management (top-up, cancel) reuses /v1/overlay/:id with the owner token
 // or a wallet-login session token.
@@ -59,8 +62,12 @@ import {
 	claimOverlayRecovery,
 	findOverlaysByUfvk,
 	createOverlaySession,
-	ufvkFingerprint
+	ufvkFingerprint,
+	setOverlayXLinkCode,
+	setOverlayXLink,
+	clearOverlayXLink
 } from './donation-overlay-store.js';
+import { verifyTweetHasCode } from './x-link-verify.js';
 import { hashToken } from './notice-board.js';
 import {
 	OVERLAY_CREATE_PER_IP_PER_MIN,
@@ -73,6 +80,8 @@ import { OVERLAY_CONFIRMATIONS_DEFAULT } from './donation-overlay-poller.js';
 const ZATOSHI_PER_ZEC = 100_000_000;
 /** Recover is cheaper than create but still UFVK-sensitive — keep tight. */
 const OVERLAY_RECOVER_PER_IP_PER_MIN = 10;
+/** Verify makes an outbound fetch per call — tighter than the other manage routes. */
+const X_LINK_VERIFY_PER_IP_PER_MIN = 6;
 
 /**
  * Validate POST /v1/ziving/page. Extends overlay credentials with a
@@ -132,6 +141,12 @@ export function publicCampaign(row, totals, { nowMs = Date.now(), urls = {} } = 
 		},
 		featured,
 		featured_until: featured ? new Date(featuredUntil).toISOString() : null,
+		xLink: row.x_handle ? {
+			handle: row.x_handle,
+			url: `https://x.com/${encodeURIComponent(row.x_handle)}`,
+			proofUrl: row.x_proof_url ?? null,
+			verifiedAt: row.x_verified_at_ms != null ? new Date(Number(row.x_verified_at_ms)).toISOString() : null
+		} : null,
 		state: overlay.state,
 		active: overlay.active,
 		credit: overlay.credit,
@@ -170,6 +185,7 @@ export function registerZivingRoutes(app, deps) {
 		nfptHealth,
 		zivingPageUrlBase = '',
 		overlayPageUrlBase = '',
+		xLinkFetchImpl = globalThis.fetch,
 		privateWatchReady,
 		privateNotConfigured,
 		now = () => Date.now(),
@@ -568,6 +584,81 @@ export function registerZivingRoutes(app, deps) {
 			recoveryCode: out.recoveryCode,
 			note: 'New recovery code — the previous one (if any) is retired. Shown exactly once; store it offline.'
 		};
+	});
+
+	// ── X (Twitter) self-attestation, step 1: issue a public nonce to post.
+	// Not a secret — anyone can see it on the page; it just ties a specific
+	// tweet to this specific campaign so proofs can't be copy-pasted between
+	// pages. Reissuing does not clear an already-verified link.
+	const xLinkStartOpts = { config: { rateLimit: { max: OVERLAY_RECOVER_PER_IP_PER_MIN, timeWindow: '1 minute' } } };
+	app.post('/v1/ziving/page/:slug/x-link/start', xLinkStartOpts, async (req, reply) => {
+		if (!watchDb) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const token = req.headers['x-overlay-token'] ?? req.body?.ownerToken;
+		const got = getOverlayAuthorised(watchDb, row.id, typeof token === 'string' ? token : '', { nowMs: now() });
+		if (got.error === 'forbidden') return reply.code(403).send({ error: { code: 'forbidden', message: 'owner token mismatch (pass it via the x-overlay-token header)' } });
+		if (got.cancelled === 1) return reply.code(409).send({ error: { code: 'cancelled', message: 'page is cancelled' } });
+		const out = setOverlayXLinkCode(watchDb, row.id);
+		return {
+			slug,
+			code: out.code,
+			instructions: `Post a public tweet containing exactly "${out.code}" from the X account you want linked, then POST { tweetUrl } to /v1/ziving/page/${encodeURIComponent(slug)}/x-link/verify. This proves you control that account — it is not an identity check, and Ziving does not vouch for you.`
+		};
+	});
+
+	// ── X self-attestation, step 2: fetch the tweet via X's public oEmbed
+	// endpoint (no API key needed) and check it contains our nonce.
+	const xLinkVerifyOpts = { config: { rateLimit: { max: X_LINK_VERIFY_PER_IP_PER_MIN, timeWindow: '1 minute' } } };
+	app.post('/v1/ziving/page/:slug/x-link/verify', xLinkVerifyOpts, async (req, reply) => {
+		if (!watchDb) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const token = req.headers['x-overlay-token'] ?? req.body?.ownerToken;
+		const got = getOverlayAuthorised(watchDb, row.id, typeof token === 'string' ? token : '', { nowMs: now() });
+		if (got.error === 'forbidden') return reply.code(403).send({ error: { code: 'forbidden', message: 'owner token mismatch (pass it via the x-overlay-token header)' } });
+		if (got.cancelled === 1) return reply.code(409).send({ error: { code: 'cancelled', message: 'page is cancelled' } });
+		if (!got.x_link_code) {
+			return reply.code(409).send({ error: { code: 'no_pending_code', message: 'call x-link/start first to get a code to post' } });
+		}
+		const tweetUrl = typeof req.body?.tweetUrl === 'string' ? req.body.tweetUrl.trim() : '';
+		const result = await verifyTweetHasCode(tweetUrl, got.x_link_code, { fetchImpl: xLinkFetchImpl });
+		if (!result.ok) {
+			return reply.code(422).send({ error: { code: result.reason ?? 'verify_failed', message: 'could not verify that tweet contains your code — check the URL and that the tweet is public' } });
+		}
+		const out = setOverlayXLink(watchDb, row.id, { handle: result.handle, proofUrl: tweetUrl, nowMs: now() });
+		log.info({ slug, overlayId: row.id, handle: result.handle }, 'ziving: x-link verified');
+		return {
+			slug,
+			xLink: { handle: out.handle, url: `https://x.com/${encodeURIComponent(out.handle)}`, proofUrl: out.proofUrl, verifiedAt: new Date(out.verifiedAtMs).toISOString() }
+		};
+	});
+
+	// ── Unlink (owner's choice, or to relink a different account). ────
+	app.delete('/v1/ziving/page/:slug/x-link', async (req, reply) => {
+		if (!watchDb) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const token = req.headers['x-overlay-token'] ?? '';
+		const got = getOverlayAuthorised(watchDb, row.id, typeof token === 'string' ? token : '', { nowMs: now() });
+		if (got.error === 'forbidden') return reply.code(403).send({ error: { code: 'forbidden', message: 'owner token mismatch (pass it via the x-overlay-token header)' } });
+		clearOverlayXLink(watchDb, row.id);
+		return { slug, unlinked: true };
 	});
 
 	app.get('/v1/ziving/page/:slug/events', async (req, reply) => {

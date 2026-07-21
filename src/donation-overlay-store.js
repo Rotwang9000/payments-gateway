@@ -186,6 +186,14 @@ function migrateDonationOverlaySchema(db) {
 	if (!cols.has('recovery_code_hash')) db.exec('ALTER TABLE donation_overlays ADD COLUMN recovery_code_hash TEXT');
 	if (!cols.has('ufvk_fingerprint')) db.exec('ALTER TABLE donation_overlays ADD COLUMN ufvk_fingerprint TEXT');
 	if (!cols.has('recovery_unlock_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN recovery_unlock_ms INTEGER');
+	// Optional self-attested X (Twitter) link — the fundraiser proves they
+	// control a public X account by posting x_link_code, then we verify via
+	// X's public oEmbed lookup. Not vetting: it just makes the fundraiser
+	// findable and gives them a reputation to stake if the campaign is bad.
+	if (!cols.has('x_link_code')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_link_code TEXT');
+	if (!cols.has('x_handle')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_handle TEXT');
+	if (!cols.has('x_proof_url')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_proof_url TEXT');
+	if (!cols.has('x_verified_at_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_verified_at_ms INTEGER');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_ufvk_fp ON donation_overlays(ufvk_fingerprint) WHERE ufvk_fingerprint IS NOT NULL');
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS overlay_sessions (
@@ -276,6 +284,14 @@ export function genOverlayRecoveryCode() {
 /** Canonical form for recovery-code comparison (paste-tolerant). */
 export function normaliseRecoveryCode(code) {
 	return String(code ?? '').toLowerCase().replace(/[^a-z0-9]/gu, '');
+}
+
+/** Public nonce a fundraiser posts on X to prove they control the account. Not a secret. */
+export function genOverlayXLinkCode() {
+	const bytes = randomBytes(8);
+	let out = 'ziving-';
+	for (let i = 0; i < bytes.length; i += 1) out += RECOVERY_ALPHABET[bytes[i] % RECOVERY_ALPHABET.length];
+	return out;
 }
 
 /** Deterministic UFVK lookup key — sha256 hex of the trimmed key text. */
@@ -603,6 +619,31 @@ export function verifyOverlayRecoveryCode(row, code) {
 	const normalised = normaliseRecoveryCode(code);
 	if (normalised.length === 0) return false;
 	return safeEqualHex(hashToken(normalised), row.recovery_code_hash);
+}
+
+/** Issue (or reissue) the X-link nonce. Reissuing does not clear an already-verified link. */
+export function setOverlayXLinkCode(db, id, { code = genOverlayXLinkCode() } = {}) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	db.prepare('UPDATE donation_overlays SET x_link_code = ? WHERE id = ?').run(code, id);
+	return { ok: true, code };
+}
+
+/** Record a verified X link (handle + the tweet used as proof). Clears the spent nonce. */
+export function setOverlayXLink(db, id, { handle, proofUrl, nowMs = Date.now() }) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	db.prepare('UPDATE donation_overlays SET x_handle = ?, x_proof_url = ?, x_verified_at_ms = ?, x_link_code = NULL WHERE id = ?')
+		.run(handle, proofUrl, nowMs, id);
+	return { ok: true, handle, proofUrl, verifiedAtMs: nowMs };
+}
+
+/** Remove a linked X account (owner's choice, or re-linking a different one). */
+export function clearOverlayXLink(db, id) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	db.prepare('UPDATE donation_overlays SET x_handle = NULL, x_proof_url = NULL, x_verified_at_ms = NULL, x_link_code = NULL WHERE id = ?').run(id);
+	return { ok: true };
 }
 
 /** Record a pending lost-key unlock purchase (settled by the receive-poller). */

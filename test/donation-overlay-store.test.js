@@ -32,7 +32,11 @@ import {
 	claimOverlayRecovery,
 	findOverlaysByUfvk,
 	createOverlaySession,
-	ufvkFingerprint
+	ufvkFingerprint,
+	genOverlayXLinkCode,
+	setOverlayXLinkCode,
+	setOverlayXLink,
+	clearOverlayXLink
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -326,5 +330,48 @@ describe('recovery codes, UFVK fingerprint lookup, wallet sessions', () => {
 		expect(getOverlayAuthorised(db, a.id, session.token, { nowMs: session.expiresAtMs + 1 }).error).toBe('forbidden');
 		// Owner tokens are untouched by sessions.
 		expect(getOverlayAuthorised(db, a.id, a.ownerToken).id).toBe(a.id);
+	});
+});
+
+describe('X (Twitter) self-attestation link', () => {
+	let db;
+	beforeEach(() => { db = openDb(); });
+
+	test('code, verify and unlink round-trip', () => {
+		const { id } = makeOverlay(db);
+		expect(getOverlay(db, id).x_link_code).toBeNull();
+		const { code } = setOverlayXLinkCode(db, id);
+		expect(code).toMatch(/^ziving-[a-z0-9]{8}$/u);
+		expect(getOverlay(db, id).x_link_code).toBe(code);
+
+		const linked = setOverlayXLink(db, id, { handle: 'alice', proofUrl: 'https://x.com/alice/status/1', nowMs: NOW });
+		expect(linked.ok).toBe(true);
+		const row = getOverlay(db, id);
+		expect(row.x_handle).toBe('alice');
+		expect(row.x_proof_url).toBe('https://x.com/alice/status/1');
+		expect(row.x_verified_at_ms).toBe(NOW);
+		// Verifying spends the nonce so an old code can't be replayed elsewhere.
+		expect(row.x_link_code).toBeNull();
+
+		expect(clearOverlayXLink(db, id).ok).toBe(true);
+		const cleared = getOverlay(db, id);
+		expect(cleared.x_handle).toBeNull();
+		expect(cleared.x_proof_url).toBeNull();
+		expect(cleared.x_verified_at_ms).toBeNull();
+	});
+
+	test('reissuing a code does not clear an already-verified link', () => {
+		const { id } = makeOverlay(db);
+		setOverlayXLinkCode(db, id);
+		setOverlayXLink(db, id, { handle: 'alice', proofUrl: 'https://x.com/alice/status/1', nowMs: NOW });
+		const { code: second } = setOverlayXLinkCode(db, id);
+		const row = getOverlay(db, id);
+		expect(row.x_handle).toBe('alice'); // still linked
+		expect(row.x_link_code).toBe(second); // but a fresh nonce is pending (e.g. to relink)
+	});
+
+	test('codes are unique enough not to collide across many calls', () => {
+		const codes = new Set(Array.from({ length: 200 }, () => genOverlayXLinkCode()));
+		expect(codes.size).toBe(200);
 	});
 });

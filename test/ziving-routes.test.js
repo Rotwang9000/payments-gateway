@@ -50,6 +50,7 @@ function buildApp(db, over = {}) {
 		nfptHealth: over.nfptHealth ?? (async () => ({ ok: true })),
 		zivingPageUrlBase: over.zivingPageUrlBase ?? 'https://ziving.org',
 		overlayPageUrlBase: over.overlayPageUrlBase ?? 'https://ziving.org/overlay.html',
+		xLinkFetchImpl: over.xLinkFetchImpl ?? (async () => { throw new Error('xLinkFetchImpl not stubbed'); }),
 		privateWatchReady: over.privateWatchReady ?? (() => true),
 		privateNotConfigured: (reply) => {
 			reply.code(503).send({ error: { code: 'private_watch_not_configured', message: 'not configured' } });
@@ -422,5 +423,66 @@ describe('ziving auth: recovery codes, wallet login, paid lost-key recovery', ()
 			headers: { 'x-overlay-token': 'wrong' }
 		});
 		expect(denied.statusCode).toBe(403);
+	});
+});
+
+describe('ziving X (Twitter) link', () => {
+	let db;
+	let app;
+	beforeEach(async () => {
+		db = openDb();
+		app = buildApp(db);
+	});
+
+	test('start requires the owner token and returns a postable code', async () => {
+		const created = (await createPage(app)).json();
+		const denied = await app.inject({ method: 'POST', url: '/v1/ziving/page/alice-run/x-link/start', headers: { 'x-overlay-token': 'wrong' } });
+		expect(denied.statusCode).toBe(403);
+		const res = await app.inject({ method: 'POST', url: '/v1/ziving/page/alice-run/x-link/start', headers: { 'x-overlay-token': created.ownerToken } });
+		expect(res.statusCode).toBe(200);
+		expect(res.json().code).toMatch(/^ziving-[a-z0-9]{8}$/u);
+	});
+
+	test('verify fails without a pending code, then succeeds once one was issued', async () => {
+		const created = (await createPage(app)).json();
+		const tooEarly = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/x-link/verify',
+			payload: { tweetUrl: 'https://x.com/alice/status/1' },
+			headers: { 'x-overlay-token': created.ownerToken }
+		});
+		expect(tooEarly.statusCode).toBe(409);
+		expect(tooEarly.json().error.code).toBe('no_pending_code');
+
+		const started = await app.inject({ method: 'POST', url: '/v1/ziving/page/alice-run/x-link/start', headers: { 'x-overlay-token': created.ownerToken } });
+		const { code } = started.json();
+
+		const badTweet = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/x-link/verify',
+			payload: { tweetUrl: 'https://x.com/alice/status/1' },
+			headers: { 'x-overlay-token': created.ownerToken }
+		});
+		expect(badTweet.statusCode).toBe(422); // stub fetchImpl throws → fetch_failed
+
+		app = buildApp(db, {
+			xLinkFetchImpl: async () => ({
+				ok: true, status: 200,
+				json: async () => ({ html: `<blockquote>proof: ${code}</blockquote>`, author_url: 'https://x.com/alice' })
+			})
+		});
+		const verified = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/x-link/verify',
+			payload: { tweetUrl: 'https://x.com/alice/status/1' },
+			headers: { 'x-overlay-token': created.ownerToken }
+		});
+		expect(verified.statusCode).toBe(200);
+		expect(verified.json().xLink.handle).toBe('alice');
+
+		const page = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(page.json().xLink).toMatchObject({ handle: 'alice', url: 'https://x.com/alice' });
+
+		const unlinked = await app.inject({ method: 'DELETE', url: '/v1/ziving/page/alice-run/x-link', headers: { 'x-overlay-token': created.ownerToken } });
+		expect(unlinked.statusCode).toBe(200);
+		const after = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(after.json().xLink).toBeNull();
 	});
 });
