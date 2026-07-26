@@ -64,6 +64,11 @@ export const OVERLAY_CONSTANTS = Object.freeze({
 	SLUG_CREATE_MIN_LEN: 5,
 	SLUG_MAX_LEN: 48,
 	STORY_MAX_LEN: 4000,
+	// "Who benefits" / "what they get" — deliberately short. These are the
+	// two things a donor actually needs, and a tight cap keeps them scannable
+	// (and keeps fundraisers from being expected to write an essay).
+	BENEFICIARY_MAX_LEN: 90,
+	OUTCOME_MAX_LEN: 140,
 	FEATURED_LIST_MAX: 24,
 	// Lost-key recovery: the owner pays this much in ZEC (memo quote) to
 	// open a claim window; the recovery code alone never rotates the token.
@@ -200,6 +205,12 @@ function migrateDonationOverlaySchema(db) {
 	// proof code and are simply left alone.
 	if (!cols.has('x_proof_code')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_proof_code TEXT');
 	if (!cols.has('x_checked_at_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_checked_at_ms INTEGER');
+	// Who benefits and what they get — the scannable core of a campaign,
+	// stored separately from the optional long story so a donor can answer
+	// "who is this for?" without reading anything.
+	if (!cols.has('beneficiary_type')) db.exec('ALTER TABLE donation_overlays ADD COLUMN beneficiary_type TEXT');
+	if (!cols.has('beneficiary')) db.exec('ALTER TABLE donation_overlays ADD COLUMN beneficiary TEXT');
+	if (!cols.has('outcome')) db.exec('ALTER TABLE donation_overlays ADD COLUMN outcome TEXT');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_ufvk_fp ON donation_overlays(ufvk_fingerprint) WHERE ufvk_fingerprint IS NOT NULL');
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS overlay_sessions (
@@ -368,6 +379,9 @@ export function createOverlay(db, {
 	minZatoshi = null,
 	slug = null,
 	story = null,
+	beneficiaryType = null,
+	beneficiary = null,
+	outcome = null,
 	goalZatoshi = null,
 	recoveryCodeHash = null,
 	ufvkFingerprintHex = null,
@@ -394,10 +408,10 @@ export function createOverlay(db, {
 	db.prepare(`
 		INSERT INTO donation_overlays
 			(id, owner_token_hash, chain, address, ufvk_ct, birthday_height, baseline_height, label, min_zatoshi,
-			 slug, story, goal_zatoshi, recovery_code_hash, ufvk_fingerprint,
+			 slug, story, beneficiary_type, beneficiary, outcome, goal_zatoshi, recovery_code_hash, ufvk_fingerprint,
 			 created_at_ms, expires_at_ms, credit_atomic, credit_topups_atomic, credit_last_billed_ms)
 		VALUES (@id, @hash, 'zcash', @address, @ufvkCt, @birthday, @baseline, @label, @minZat,
-		        @slug, @story, @goalZat, @recoveryHash, @ufvkFp,
+		        @slug, @story, @beneficiaryType, @beneficiary, @outcome, @goalZat, @recoveryHash, @ufvkFp,
 		        @now, @expires, @credit, @credit, @now)
 	`).run({
 		id,
@@ -410,6 +424,9 @@ export function createOverlay(db, {
 		minZat: minZatoshi != null ? String(minZatoshi) : null,
 		slug: slug ?? null,
 		story: story ?? null,
+		beneficiaryType: beneficiaryType ?? null,
+		beneficiary: beneficiary ?? null,
+		outcome: outcome ?? null,
 		goalZat: goalZatoshi != null ? String(goalZatoshi) : null,
 		recoveryHash: recoveryCodeHash ?? null,
 		ufvkFp: ufvkFingerprintHex ?? null,

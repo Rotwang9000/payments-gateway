@@ -11,7 +11,8 @@ import {
 	ensureDonationOverlaySchema,
 	getOverlayBySlug,
 	recordDonationEvent,
-	cancelOverlay
+	cancelOverlay,
+	OVERLAY_CONSTANTS
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -108,6 +109,57 @@ describe('validateZivingPageRequest', () => {
 			expect(() => validateZivingPageRequest({ slug, ufvk: UFVK, address: ADDR, amountUsdCents: 500 }, POLICY))
 				.toThrow(/reserved/);
 		}
+	});
+
+	test('keeps the who-benefits pair and normalises the type', () => {
+		const out = validateZivingPageRequest({
+			slug: 'alice-run',
+			ufvk: UFVK,
+			address: ADDR,
+			amountUsdCents: 500,
+			beneficiaryType: ' OTHERS ',
+			beneficiary: '30 pupils at a village school in Mongolia',
+			outcome: 'Ten refurbished laptops and a year of internet'
+		}, POLICY);
+		expect(out.beneficiaryType).toBe('others');
+		expect(out.beneficiary).toBe('30 pupils at a village school in Mongolia');
+		expect(out.outcome).toBe('Ten refurbished laptops and a year of internet');
+	});
+
+	test('rejects an unknown beneficiary type', () => {
+		expect(() => validateZivingPageRequest({
+			slug: 'alice-run', ufvk: UFVK, address: ADDR, amountUsdCents: 500, beneficiaryType: 'shareholders'
+		}, POLICY)).toThrow(/beneficiaryType must be one of/);
+	});
+
+	test('benefit fields stay optional so existing callers keep working', () => {
+		const out = validateZivingPageRequest({ slug: 'alice-run', ufvk: UFVK, address: ADDR, amountUsdCents: 500 }, POLICY);
+		expect(out.beneficiaryType).toBeNull();
+		expect(out.beneficiary).toBeNull();
+		expect(out.outcome).toBeNull();
+	});
+
+	test('trims the benefit fields to keep them scannable', () => {
+		const out = validateZivingPageRequest({
+			slug: 'alice-run',
+			ufvk: UFVK,
+			address: ADDR,
+			amountUsdCents: 500,
+			beneficiary: 'x'.repeat(400),
+			outcome: 'y'.repeat(400)
+		}, POLICY);
+		expect(out.beneficiary).toHaveLength(OVERLAY_CONSTANTS.BENEFICIARY_MAX_LEN);
+		expect(out.outcome).toHaveLength(OVERLAY_CONSTANTS.OUTCOME_MAX_LEN);
+	});
+
+	test('blank benefit fields collapse to null rather than empty strings', () => {
+		const out = validateZivingPageRequest({
+			slug: 'alice-run', ufvk: UFVK, address: ADDR, amountUsdCents: 500,
+			beneficiaryType: '', beneficiary: '   ', outcome: ''
+		}, POLICY);
+		expect(out.beneficiaryType).toBeNull();
+		expect(out.beneficiary).toBeNull();
+		expect(out.outcome).toBeNull();
 	});
 });
 
@@ -423,6 +475,61 @@ describe('ziving auth: recovery codes, wallet login, paid lost-key recovery', ()
 			headers: { 'x-overlay-token': 'wrong' }
 		});
 		expect(denied.statusCode).toBe(403);
+	});
+});
+
+describe('who benefits / what they get', () => {
+	let db;
+	let app;
+	beforeEach(async () => { db = openDb(); app = buildApp(db); await app.ready(); });
+
+	test('survives create and lands on the public page with a donor-facing label', async () => {
+		const created = await createPage(app, {
+			beneficiaryType: 'others',
+			beneficiary: '30 pupils at a village school in Mongolia',
+			outcome: 'Ten refurbished laptops and a year of internet'
+		});
+		expect(created.statusCode).toBe(201);
+		expect(created.json().page.benefit).toEqual({
+			type: 'others',
+			typeLabel: 'Other people',
+			who: '30 pupils at a village school in Mongolia',
+			what: 'Ten refurbished laptops and a year of internet'
+		});
+
+		const page = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(page.json().benefit).toMatchObject({ typeLabel: 'Other people', what: 'Ten refurbished laptops and a year of internet' });
+	});
+
+	test('"me, I get money" is a legitimate answer', async () => {
+		await createPage(app, { beneficiaryType: 'self', beneficiary: 'Me — a solo dev', outcome: 'Rent and time to keep shipping' });
+		const page = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(page.json().benefit).toMatchObject({ type: 'self', typeLabel: 'The fundraiser' });
+	});
+
+	test('pages created before we asked report benefit: null, not a hollow object', async () => {
+		await createPage(app);
+		const page = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(page.json().benefit).toBeNull();
+	});
+
+	test('a partial answer still shows, rather than being dropped', async () => {
+		await createPage(app, { beneficiary: 'The Zcash community' });
+		const page = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(page.json().benefit).toEqual({ type: null, typeLabel: null, who: 'The Zcash community', what: null });
+	});
+
+	test('a bad beneficiary type is rejected at create with a helpful message', async () => {
+		const res = await createPage(app, { beneficiaryType: 'shareholders' });
+		expect(res.statusCode).toBe(400);
+		expect(res.json().error.message).toMatch(/beneficiaryType must be one of/);
+	});
+
+	test('featured cards carry the benefit so the homepage can be scanned', async () => {
+		const created = (await createPage(app, { beneficiaryType: 'public', beneficiary: 'Anyone using Zcash' })).json();
+		db.prepare('UPDATE donation_overlays SET featured_until_ms = ? WHERE id = ?').run(NOW + 86_400_000, created.overlayId);
+		const res = await app.inject({ method: 'GET', url: '/v1/ziving/featured' });
+		expect(res.json().campaigns[0].benefit).toMatchObject({ typeLabel: 'A public good', who: 'Anyone using Zcash' });
 	});
 });
 

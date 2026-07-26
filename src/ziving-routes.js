@@ -94,8 +94,34 @@ export const X_LINK_RECHECK_MS = 24 * 60 * 60 * 1000;
 const X_LINK_FATAL_REASONS = new Set(['tweet_not_found', 'code_not_found_in_tweet', 'not_a_tweet_url', 'no_author']);
 
 /**
+ * Who a campaign is for, donor-facing. Fundraisers pick from a fixed set so
+ * the answer is scannable and comparable across pages — the free-text
+ * `beneficiary` says who specifically. The wizard shows these first-person
+ * ("Me", "A group I'm part of"); these labels are how donors read them.
+ */
+export const BENEFICIARY_TYPES = Object.freeze({
+	self: 'The fundraiser',
+	group: "The fundraiser's group",
+	others: 'Other people',
+	public: 'A public good'
+});
+
+/** Optional short public text (who benefits / what they get). */
+function optionalShortText(value, maxLen, field) {
+	if (value === undefined || value === null || value === '') return null;
+	if (typeof value !== 'string') throw new TypeError(`${field} must be a string`);
+	const clean = sanitiseText(value, maxLen);
+	return clean.length === 0 ? null : clean;
+}
+
+/**
  * Validate POST /v1/ziving/page. Extends overlay credentials with a
- * required slug and optional public story + goal.
+ * required slug, the optional "who benefits / what they get" pair, and an
+ * optional long story + goal.
+ *
+ * The benefit fields stay optional here so existing programmatic callers
+ * keep working; the create wizard requires them, because a page that can't
+ * say who it helps is exactly what donors can't assess.
  */
 export function validateZivingPageRequest(body, policy) {
 	const base = validateOverlayCreateRequest(body, policy);
@@ -114,6 +140,15 @@ export function validateZivingPageRequest(body, policy) {
 		story = sanitiseText(body.story, OVERLAY_CONSTANTS.STORY_MAX_LEN);
 		if (story.length === 0) story = null;
 	}
+	let beneficiaryType = null;
+	if (body.beneficiaryType !== undefined && body.beneficiaryType !== null && body.beneficiaryType !== '') {
+		beneficiaryType = String(body.beneficiaryType).trim().toLowerCase();
+		if (!Object.hasOwn(BENEFICIARY_TYPES, beneficiaryType)) {
+			throw new TypeError(`beneficiaryType must be one of: ${Object.keys(BENEFICIARY_TYPES).join(', ')}`);
+		}
+	}
+	const beneficiary = optionalShortText(body.beneficiary, OVERLAY_CONSTANTS.BENEFICIARY_MAX_LEN, 'beneficiary');
+	const outcome = optionalShortText(body.outcome, OVERLAY_CONSTANTS.OUTCOME_MAX_LEN, 'outcome');
 	let goalZatoshi = null;
 	if (body.goalZec !== undefined && body.goalZec !== null && body.goalZec !== '') {
 		const z = Number(body.goalZec);
@@ -122,7 +157,7 @@ export function validateZivingPageRequest(body, policy) {
 		}
 		goalZatoshi = String(Math.round(z * ZATOSHI_PER_ZEC));
 	}
-	return Object.freeze({ ...base, slug, story, goalZatoshi });
+	return Object.freeze({ ...base, slug, story, beneficiaryType, beneficiary, outcome, goalZatoshi });
 }
 
 /** Public campaign view — no UFVK, no owner token. */
@@ -137,6 +172,14 @@ export function publicCampaign(row, totals, { nowMs = Date.now(), urls = {} } = 
 		overlayId: row.id,
 		label: row.label ?? null,
 		story: row.story ?? null,
+		// The scannable answer to "who is this for, and what will exist
+		// afterwards?" — null on pages created before we asked.
+		benefit: (row.beneficiary || row.outcome || row.beneficiary_type) ? {
+			type: row.beneficiary_type ?? null,
+			typeLabel: BENEFICIARY_TYPES[row.beneficiary_type] ?? null,
+			who: row.beneficiary ?? null,
+			what: row.outcome ?? null
+		} : null,
 		address: row.address,
 		chain: row.chain,
 		minZec: overlay.minZec,
@@ -235,7 +278,7 @@ export function registerZivingRoutes(app, deps) {
 			spec: 'JustGiving-style campaign pages on shielded ZEC. No accounts, no custody: donors pay your wallet directly; your UFVK (read-only) is encrypted at rest for donation monitoring.',
 			how_it_works: [
 				'1. Create a donation-only shielded wallet in Winbit32 (vault or receive wizard) and export the UFVK + unified address.',
-				'2. POST /v1/ziving/page { slug, label, story?, goalZec?, ufvk, address, amountUsdCents? } — returns your public page URL, ownerToken + recoveryCode (each shown once) and a ZEC funding quote.',
+				'2. POST /v1/ziving/page { slug, label, beneficiaryType?, beneficiary?, outcome?, story?, goalZec?, ufvk, address, amountUsdCents? } — returns your public page URL, ownerToken + recoveryCode (each shown once) and a ZEC funding quote.',
 				'3. Share the page; donations appear live on the page and in the OBS overlay feed.',
 				'4. Top up scanning with POST /v1/overlay/:id/topup; promote on the homepage with POST /v1/ziving/page/:slug/feature (header x-overlay-token). Wallet holders can POST /v1/ziving/wallet/login { ufvk } for a page list + manage session.',
 				'5. Lost the ownerToken? POST /v1/ziving/page/:slug/recover { recoveryCode } → pay the small ZEC quote → POST .../recover/claim { recoveryCode } for a fresh ownerToken.'
@@ -259,7 +302,14 @@ export function registerZivingRoutes(app, deps) {
 				max_usd: policy.maxUsdCents / 100,
 				suggested_scan_usd: [5, 10, 25]
 			},
-			privacy: 'we store: your UFVK (AES-256-GCM encrypted), your public receive address, optional label/story/goal, optional featured-until. Donation events (amount + memo) prune after 30 days. No accounts, email or IPs.',
+			campaign_fields: {
+				note: 'Donors want two things up front: who benefits, and what they get. Keep both short — they are shown above the story, which is optional.',
+				beneficiaryType: Object.entries(BENEFICIARY_TYPES).map(([code, label]) => `${code} — ${label}`),
+				beneficiary: `free text, who specifically benefits (max ${OVERLAY_CONSTANTS.BENEFICIARY_MAX_LEN} chars), e.g. "30 pupils at a village school in Mongolia"`,
+				outcome: `free text, what they end up with (max ${OVERLAY_CONSTANTS.OUTCOME_MAX_LEN} chars), e.g. "ten refurbished laptops and a year of internet"`,
+				story: `optional longer detail (max ${OVERLAY_CONSTANTS.STORY_MAX_LEN} chars) — nobody has to write an essay`
+			},
+			privacy: 'we store: your UFVK (AES-256-GCM encrypted), your public receive address, optional label/beneficiary/outcome/story/goal, optional featured-until. Donation events (amount + memo) prune after 30 days. No accounts, email or IPs.',
 			zec_funding_enabled: zecEnabled()
 		};
 		return info;
@@ -356,6 +406,9 @@ export function registerZivingRoutes(app, deps) {
 				minZatoshi: input.minZatoshi,
 				slug: input.slug,
 				story: input.story,
+				beneficiaryType: input.beneficiaryType,
+				beneficiary: input.beneficiary,
+				outcome: input.outcome,
 				goalZatoshi: input.goalZatoshi,
 				recoveryCodeHash: hashToken(normaliseRecoveryCode(recoveryCode)),
 				ufvkFingerprintHex: ufvkFingerprint(input.ufvk),
