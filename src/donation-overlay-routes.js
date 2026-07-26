@@ -118,7 +118,7 @@ export function publicOverlay(row, { nowMs = Date.now() } = {}) {
 }
 
 /** Public view of a funding quote row (mirrors topup-crypto's shape, overlay-flavoured). */
-export function publicOverlayQuote(row, { confirmationsRequired }) {
+export function publicOverlayQuote(row, { confirmationsRequired, flexibleAmount = false }) {
 	return {
 		quoteId: row.id,
 		chain: row.chain,
@@ -134,7 +134,10 @@ export function publicOverlayQuote(row, { confirmationsRequired }) {
 		confirmations: { required: confirmationsRequired, seen: row.confirmations ?? 0 },
 		createdAt: new Date(row.created_at_ms).toISOString(),
 		expiresAt: new Date(row.expires_at_ms).toISOString(),
-		instructions: `Send ${formatCoinAmount(BigInt(row.expected_atomic), 'zcash')} ZEC to ${row.recv_address} with the memo "${row.memo}" before the quote expires. ${formatUsdCents(row.quoted_usd_cents)} of overlay credit lands after ${confirmationsRequired} confirmations. Check status: GET /v1/overlay/quote/${row.id} (header x-overlay-token).`
+		// Credit follows the amount actually received at this quote's locked
+		// rate, so an approximate payment is fine — say so rather than letting
+		// people think a rounded-down send loses everything.
+		instructions: `Send ${formatCoinAmount(BigInt(row.expected_atomic), 'zcash')} ZEC to ${row.recv_address} with the memo "${row.memo}" before the quote expires. ${formatUsdCents(row.quoted_usd_cents)} of overlay credit lands after ${confirmationsRequired} confirmations.${flexibleAmount ? ' Send more or less if you prefer — credit is whatever you actually send, valued at this quote\'s locked rate.' : ''} Check status: GET /v1/overlay/quote/${row.id} (header x-overlay-token).`
 	};
 }
 
@@ -330,7 +333,7 @@ export function registerDonationOverlayRoutes(app, deps) {
 			status: 'active_awaiting_payment',
 			graceNote: `The overlay is live NOW on $${atomicToUsdString(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC)} of grace credit (~1.5 days). Pay the quote below and ${formatUsdCents(input.amountUsdCents)} of credit lands automatically after ${confirmationsRequired} confirmations.`,
 			urls: urlsFor(created.id),
-			payment: publicOverlayQuote(quoteRow, { confirmationsRequired }),
+			payment: publicOverlayQuote(quoteRow, { confirmationsRequired, flexibleAmount: true }),
 			overlay: publicOverlay(getOverlay(watchDb, created.id), { nowMs }),
 			note: 'Keep the ownerToken safe — it is shown exactly ONCE and is the only way to top up or cancel. The overlayId is the public capability for the OBS page; anyone holding it can read your donation feed.'
 		});
@@ -421,7 +424,7 @@ export function registerDonationOverlayRoutes(app, deps) {
 			expiresAtMs: nowMs + policy.quoteTtlSec * 1000
 		});
 		log.info({ overlayId: got.id, usdCents: cents, quoteId: quoteRow.id }, 'overlay: top-up quote created');
-		return reply.code(201).send(publicOverlayQuote(quoteRow, { confirmationsRequired }));
+		return reply.code(201).send(publicOverlayQuote(quoteRow, { confirmationsRequired, flexibleAmount: true }));
 	});
 
 	// ── GET /v1/overlay/quote/:quoteId — funding quote status ─────

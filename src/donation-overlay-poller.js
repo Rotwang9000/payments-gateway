@@ -99,6 +99,20 @@ export function makeOverlayScanner(nfptClient, { pollIntervalMs = 4_000, maxWait
 export function makeOverlayCreditApplier(db) {
 	if (!db) throw new TypeError('makeOverlayCreditApplier: db required');
 	const CENTS_TO_ATOMIC_USDC = 10_000;
+	/**
+	 * Money paid over a fixed-price product's quote becomes scanning credit
+	 * rather than vanishing: the poller now credits whatever was actually
+	 * sent, so a $5 feature paid with $25 leaves $20 that is still theirs.
+	 * Best-effort — the product has already been granted, so a failed
+	 * top-up must not fail the settlement.
+	 */
+	const refundExcess = (overlayId, usdCents, quotedUsdCents) => {
+		const excess = usdCents - (Number(quotedUsdCents) || 0);
+		if (!Number.isInteger(excess) || excess <= 0) return 0;
+		const out = topupOverlayById(db, overlayId, { creditAtomic: excess * CENTS_TO_ATOMIC_USDC });
+		return out.ok ? excess : 0;
+	};
+
 	return ({ watchId, usdCents, quoteId = null }) => {
 		if (!Number.isInteger(usdCents) || usdCents <= 0) return { ok: false, reason: 'invalid_amount' };
 		// Lost-key unlock payments settle first — they must never be
@@ -106,12 +120,20 @@ export function makeOverlayCreditApplier(db) {
 		// quoteId (when the poller supplies it) pins the dispatch to the
 		// exact quote that was paid instead of guessing by price.
 		const rec = applyRecoveryUnlock(db, watchId, { quoteId, usdCents });
-		if (rec.ok) return { ok: true, kind: 'recovery_unlock', unlockUntilMs: rec.unlockUntilMs };
+		if (rec.ok) {
+			return {
+				ok: true, kind: 'recovery_unlock', unlockUntilMs: rec.unlockUntilMs,
+				excessCreditedUsdCents: refundExcess(watchId, usdCents, rec.quotedUsdCents)
+			};
+		}
 		if (rec.reason && rec.reason !== 'no_pending_recovery') return { ok: false, reason: rec.reason };
 		// Homepage feature quotes settle next (same overlay id, distinct cents).
 		const feat = applyFeaturePurchase(db, watchId, { quoteId, usdCents });
 		if (feat.ok) {
-			return { ok: true, kind: 'feature', featuredUntilMs: feat.featuredUntilMs, days: feat.days };
+			return {
+				ok: true, kind: 'feature', featuredUntilMs: feat.featuredUntilMs, days: feat.days,
+				excessCreditedUsdCents: refundExcess(watchId, usdCents, feat.quotedUsdCents)
+			};
 		}
 		if (feat.reason && feat.reason !== 'no_pending_feature') {
 			return { ok: false, reason: feat.reason };

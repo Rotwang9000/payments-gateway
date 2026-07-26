@@ -504,7 +504,7 @@ export function registerZivingRoutes(app, deps) {
 			status: 'active_awaiting_payment',
 			graceNote: `The page is live NOW on $${atomicToUsdString(OVERLAY_CONSTANTS.GRACE_CREDIT_ATOMIC)} of grace credit (~1.5 days). Pay the quote below and ${formatUsdCents(input.amountUsdCents)} of credit lands automatically after ${confirmationsRequired} confirmations.`,
 			urls: urlsFor(row),
-			payment: publicOverlayQuote(quoteRow, { confirmationsRequired }),
+			payment: publicOverlayQuote(quoteRow, { confirmationsRequired, flexibleAmount: true }),
 			page: publicCampaign(row, totals, { nowMs, urls: urlsFor(row) }),
 			note: 'Keep the ownerToken (manage key) AND recoveryCode safe — both shown exactly ONCE. The ownerToken manages the page (/v1/overlay/:id/topup, DELETE /v1/overlay/:id, feature). If you lose it, the recoveryCode + a small ZEC payment issues a new one. Recommend a donation-only wallet; a UFVK reveals all incoming amounts and memos.'
 		});

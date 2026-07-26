@@ -557,7 +557,12 @@ export function applyFeaturePurchase(db, overlayId, { quoteId = null, days, usdC
 	const until = base + (pending.days * 86_400_000);
 	db.prepare('UPDATE donation_overlays SET featured_until_ms = ? WHERE id = ?').run(until, overlayId);
 	db.prepare('UPDATE ziving_feature_quotes SET settled = 1 WHERE quote_id = ?').run(pending.quote_id);
-	return { ok: true, featuredUntilMs: until, days: pending.days, row: getOverlay(db, overlayId) };
+	// quotedUsdCents lets the caller hand back any over-payment as scanning
+	// credit — a fixed-price product should not swallow the difference.
+	return {
+		ok: true, featuredUntilMs: until, days: pending.days,
+		quotedUsdCents: Number(pending.usd_cents), row: getOverlay(db, overlayId)
+	};
 }
 
 /** Live homepage-featured campaigns (slug set, not cancelled, still featured). */
@@ -786,7 +791,7 @@ export function applyRecoveryUnlock(db, overlayId, {
 	const unlockUntilMs = nowMs + windowMs;
 	db.prepare('UPDATE donation_overlays SET recovery_unlock_ms = ? WHERE id = ?').run(unlockUntilMs, overlayId);
 	db.prepare('UPDATE ziving_recovery_quotes SET settled = 1 WHERE quote_id = ?').run(pending.quote_id);
-	return { ok: true, unlockUntilMs };
+	return { ok: true, unlockUntilMs, quotedUsdCents: Number(pending.usd_cents) };
 }
 
 /**

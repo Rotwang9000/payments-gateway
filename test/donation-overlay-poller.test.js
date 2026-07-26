@@ -10,6 +10,8 @@ import {
 	getOverlay,
 	updateOverlayState,
 	listEventsSince,
+	createFeatureQuote,
+	createRecoveryQuoteRow,
 	OVERLAY_CONSTANTS
 } from '../src/donation-overlay-store.js';
 import {
@@ -235,5 +237,37 @@ describe('makeOverlayCreditApplier', () => {
 		expect(getOverlay(db, id).credit_atomic).toBe(1_000_000 + 2_000_000);
 		expect(apply({ watchId: 'ov_missing', usdCents: 200 }).reason).toBe('not_found');
 		expect(apply({ watchId: id, usdCents: 0 }).reason).toBe('invalid_amount');
+	});
+
+	test('over-paying a feature quote turns the excess into scanning credit', () => {
+		const db = openDb();
+		const { id } = makeOverlay(db);
+		createFeatureQuote(db, { quoteId: 'q-feat', overlayId: id, days: 1, usdCents: 500, nowMs: NOW });
+		const before = getOverlay(db, id).credit_atomic;
+		// $25 sent against a $5 one-day feature.
+		const out = makeOverlayCreditApplier(db)({ watchId: id, usdCents: 2500, quoteId: 'q-feat' });
+		expect(out).toMatchObject({ ok: true, kind: 'feature', days: 1, excessCreditedUsdCents: 2000 });
+		expect(getOverlay(db, id).credit_atomic).toBe(before + 2000 * 10_000);
+		expect(getOverlay(db, id).featured_until_ms).toBeGreaterThan(NOW);
+	});
+
+	test('paying a feature quote exactly leaves no excess', () => {
+		const db = openDb();
+		const { id } = makeOverlay(db);
+		createFeatureQuote(db, { quoteId: 'q-feat', overlayId: id, days: 1, usdCents: 500, nowMs: NOW });
+		const before = getOverlay(db, id).credit_atomic;
+		const out = makeOverlayCreditApplier(db)({ watchId: id, usdCents: 500, quoteId: 'q-feat' });
+		expect(out).toMatchObject({ ok: true, kind: 'feature', excessCreditedUsdCents: 0 });
+		expect(getOverlay(db, id).credit_atomic).toBe(before);
+	});
+
+	test('over-paying a lost-key unlock also lands as scanning credit', () => {
+		const db = openDb();
+		const { id } = makeOverlay(db);
+		createRecoveryQuoteRow(db, { quoteId: 'q-rec', overlayId: id, usdCents: 200, nowMs: NOW });
+		const before = getOverlay(db, id).credit_atomic;
+		const out = makeOverlayCreditApplier(db)({ watchId: id, usdCents: 700, quoteId: 'q-rec' });
+		expect(out).toMatchObject({ ok: true, kind: 'recovery_unlock', excessCreditedUsdCents: 500 });
+		expect(getOverlay(db, id).credit_atomic).toBe(before + 500 * 10_000);
 	});
 });
