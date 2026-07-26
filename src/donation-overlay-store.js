@@ -194,6 +194,12 @@ function migrateDonationOverlaySchema(db) {
 	if (!cols.has('x_handle')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_handle TEXT');
 	if (!cols.has('x_proof_url')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_proof_url TEXT');
 	if (!cols.has('x_verified_at_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_verified_at_ms INTEGER');
+	// x_proof_code is the nonce the proof tweet actually contains, kept after
+	// x_link_code is spent so the link can be re-checked later; x_checked_at_ms
+	// paces those re-checks. Links verified before these existed have a null
+	// proof code and are simply left alone.
+	if (!cols.has('x_proof_code')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_proof_code TEXT');
+	if (!cols.has('x_checked_at_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN x_checked_at_ms INTEGER');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_ufvk_fp ON donation_overlays(ufvk_fingerprint) WHERE ufvk_fingerprint IS NOT NULL');
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS overlay_sessions (
@@ -629,21 +635,57 @@ export function setOverlayXLinkCode(db, id, { code = genOverlayXLinkCode() } = {
 	return { ok: true, code };
 }
 
-/** Record a verified X link (handle + the tweet used as proof). Clears the spent nonce. */
-export function setOverlayXLink(db, id, { handle, proofUrl, nowMs = Date.now() }) {
+/**
+ * Record a verified X link (handle + the tweet used as proof). Clears the
+ * spent nonce but keeps a copy as x_proof_code so the proof can be re-checked
+ * later, independent of any nonce the owner reissues afterwards.
+ */
+export function setOverlayXLink(db, id, { handle, proofUrl, proofCode = null, nowMs = Date.now() }) {
 	const row = getOverlay(db, id);
 	if (!row) return { ok: false, reason: 'not_found' };
-	db.prepare('UPDATE donation_overlays SET x_handle = ?, x_proof_url = ?, x_verified_at_ms = ?, x_link_code = NULL WHERE id = ?')
-		.run(handle, proofUrl, nowMs, id);
+	db.prepare(`
+		UPDATE donation_overlays
+		SET x_handle = ?, x_proof_url = ?, x_proof_code = ?, x_verified_at_ms = ?, x_checked_at_ms = ?, x_link_code = NULL
+		WHERE id = ?
+	`).run(handle, proofUrl, proofCode, nowMs, nowMs, id);
 	return { ok: true, handle, proofUrl, verifiedAtMs: nowMs };
 }
 
-/** Remove a linked X account (owner's choice, or re-linking a different one). */
+/** Remove a linked X account (owner's choice, re-linking, or a failed re-check). */
 export function clearOverlayXLink(db, id) {
 	const row = getOverlay(db, id);
 	if (!row) return { ok: false, reason: 'not_found' };
-	db.prepare('UPDATE donation_overlays SET x_handle = NULL, x_proof_url = NULL, x_verified_at_ms = NULL, x_link_code = NULL WHERE id = ?').run(id);
+	db.prepare(`
+		UPDATE donation_overlays
+		SET x_handle = NULL, x_proof_url = NULL, x_proof_code = NULL,
+		    x_verified_at_ms = NULL, x_checked_at_ms = NULL, x_link_code = NULL
+		WHERE id = ?
+	`).run(id);
 	return { ok: true };
+}
+
+/**
+ * Claim the right to re-check this page's X proof, at most once per
+ * `staleAfterMs`. The stamp is written *before* the network call so that
+ * concurrent page views don't all fetch X at once — a check that then fails
+ * transiently just costs another interval of staleness. Returns whether the
+ * caller won the claim.
+ */
+export function claimOverlayXLinkRecheck(db, id, { nowMs = Date.now(), staleAfterMs }) {
+	const cutoff = nowMs - staleAfterMs;
+	const res = db.prepare(`
+		UPDATE donation_overlays SET x_checked_at_ms = ?
+		WHERE id = ? AND x_handle IS NOT NULL AND x_proof_code IS NOT NULL
+		  AND (x_checked_at_ms IS NULL OR x_checked_at_ms <= ?)
+	`).run(nowMs, id, cutoff);
+	return { claimed: res.changes === 1 };
+}
+
+/** A re-check found the proof intact under a renamed account — keep the link, follow the handle. */
+export function updateOverlayXLinkHandle(db, id, handle) {
+	const res = db.prepare('UPDATE donation_overlays SET x_handle = ? WHERE id = ? AND x_handle IS NOT NULL')
+		.run(handle, id);
+	return { ok: res.changes === 1 };
 }
 
 /** Record a pending lost-key unlock purchase (settled by the receive-poller). */

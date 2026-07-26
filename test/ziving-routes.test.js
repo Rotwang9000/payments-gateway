@@ -486,3 +486,100 @@ describe('ziving X (Twitter) link', () => {
 		expect(after.json().xLink).toBeNull();
 	});
 });
+
+describe('ziving X link re-check on page views', () => {
+	const TWEET = 'https://x.com/alice/status/1';
+	const oembed = (text, authorUrl = 'https://x.com/alice') => ({
+		ok: true, status: 200,
+		json: async () => ({ html: `<blockquote>${text}</blockquote>`, author_url: authorUrl })
+	});
+	/** The re-check runs off the request path, so let its promise settle. */
+	const flush = async () => { for (let i = 0; i < 3; i += 1) await new Promise((r) => setImmediate(r)); };
+
+	let db;
+	let app;
+	beforeEach(() => { db = openDb(); app = buildApp(db); });
+
+	/** Link @alice for real, then age the check stamp so the next view re-checks. */
+	async function linkAndAge(ownerToken) {
+		const started = await app.inject({ method: 'POST', url: '/v1/ziving/page/alice-run/x-link/start', headers: { 'x-overlay-token': ownerToken } });
+		const { code } = started.json();
+		app = buildApp(db, { xLinkFetchImpl: async () => oembed(`proof: ${code}`) });
+		const verified = await app.inject({
+			method: 'POST', url: '/v1/ziving/page/alice-run/x-link/verify',
+			payload: { tweetUrl: TWEET }, headers: { 'x-overlay-token': ownerToken }
+		});
+		expect(verified.statusCode).toBe(200);
+		db.prepare('UPDATE donation_overlays SET x_checked_at_ms = 0').run();
+		return code;
+	}
+
+	test('a deleted proof tweet drops the badge, one view later', async () => {
+		const created = (await createPage(app)).json();
+		await linkAndAge(created.ownerToken);
+
+		app = buildApp(db, { xLinkFetchImpl: async () => ({ ok: false, status: 404 }) });
+		// The view that triggers the re-check still serves the old answer —
+		// donors never wait on X.
+		const during = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(during.json().xLink.handle).toBe('alice');
+		await flush();
+		const after = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(after.json().xLink).toBeNull();
+	});
+
+	test('an edited tweet that no longer carries the code drops the badge', async () => {
+		const created = (await createPage(app)).json();
+		await linkAndAge(created.ownerToken);
+
+		app = buildApp(db, { xLinkFetchImpl: async () => oembed('nothing to see here') });
+		await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		await flush();
+		const after = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(after.json().xLink).toBeNull();
+	});
+
+	test('X being unreachable never unlinks anyone', async () => {
+		const created = (await createPage(app)).json();
+		await linkAndAge(created.ownerToken);
+
+		for (const broken of [
+			async () => { throw new Error('ECONNREFUSED'); },
+			async () => ({ ok: false, status: 503 }),
+			async () => ({ ok: true, status: 200, json: async () => { throw new Error('not json'); } })
+		]) {
+			db.prepare('UPDATE donation_overlays SET x_checked_at_ms = 0').run();
+			app = buildApp(db, { xLinkFetchImpl: broken });
+			await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+			await flush();
+			const after = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+			expect(after.json().xLink.handle).toBe('alice');
+		}
+	});
+
+	test('a renamed account keeps its badge under the new handle', async () => {
+		const created = (await createPage(app)).json();
+		const code = await linkAndAge(created.ownerToken);
+
+		app = buildApp(db, { xLinkFetchImpl: async () => oembed(`proof: ${code}`, 'https://x.com/alice_zec') });
+		await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		await flush();
+		const after = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(after.json().xLink).toMatchObject({ handle: 'alice_zec', url: 'https://x.com/alice_zec', proofUrl: TWEET });
+	});
+
+	test('a burst of page views only hits X once', async () => {
+		const created = (await createPage(app)).json();
+		const code = await linkAndAge(created.ownerToken);
+
+		let calls = 0;
+		app = buildApp(db, { xLinkFetchImpl: async () => { calls += 1; return oembed(`proof: ${code}`); } });
+		await Promise.all(Array.from({ length: 10 }, () => app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })));
+		await flush();
+		expect(calls).toBe(1);
+		// And the fresh stamp means the next view doesn't check again either.
+		await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		await flush();
+		expect(calls).toBe(1);
+	});
+});

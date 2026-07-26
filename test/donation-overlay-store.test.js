@@ -36,7 +36,9 @@ import {
 	genOverlayXLinkCode,
 	setOverlayXLinkCode,
 	setOverlayXLink,
-	clearOverlayXLink
+	clearOverlayXLink,
+	claimOverlayXLinkRecheck,
+	updateOverlayXLinkHandle
 } from '../src/donation-overlay-store.js';
 
 const NOW = 1_700_000_000_000;
@@ -373,5 +375,54 @@ describe('X (Twitter) self-attestation link', () => {
 	test('codes are unique enough not to collide across many calls', () => {
 		const codes = new Set(Array.from({ length: 200 }, () => genOverlayXLinkCode()));
 		expect(codes.size).toBe(200);
+	});
+
+	test('the proof code survives the spent nonce and a later reissue', () => {
+		const { id } = makeOverlay(db);
+		const { code } = setOverlayXLinkCode(db, id);
+		setOverlayXLink(db, id, { handle: 'alice', proofUrl: 'https://x.com/alice/status/1', proofCode: code, nowMs: NOW });
+		setOverlayXLinkCode(db, id); // owner starts relinking, then abandons it
+		const row = getOverlay(db, id);
+		expect(row.x_proof_code).toBe(code); // re-checks still know what to look for
+		expect(row.x_checked_at_ms).toBe(NOW);
+	});
+
+	test('re-check can be claimed once per interval, and only when there is a proof to check', () => {
+		const day = 24 * 60 * 60 * 1000;
+		const { id } = makeOverlay(db);
+		// Nothing linked yet — nothing to re-check.
+		expect(claimOverlayXLinkRecheck(db, id, { nowMs: NOW, staleAfterMs: day }).claimed).toBe(false);
+
+		const { code } = setOverlayXLinkCode(db, id);
+		setOverlayXLink(db, id, { handle: 'alice', proofUrl: 'https://x.com/alice/status/1', proofCode: code, nowMs: NOW });
+		// Freshly verified, so not due.
+		expect(claimOverlayXLinkRecheck(db, id, { nowMs: NOW + 1000, staleAfterMs: day }).claimed).toBe(false);
+
+		const due = NOW + day + 1;
+		expect(claimOverlayXLinkRecheck(db, id, { nowMs: due, staleAfterMs: day }).claimed).toBe(true);
+		// A second viewer arriving in the same moment must not also hit X.
+		expect(claimOverlayXLinkRecheck(db, id, { nowMs: due, staleAfterMs: day }).claimed).toBe(false);
+	});
+
+	test('links verified before proof codes existed are never re-checked', () => {
+		const { id } = makeOverlay(db);
+		setOverlayXLink(db, id, { handle: 'alice', proofUrl: 'https://x.com/alice/status/1', nowMs: NOW });
+		const day = 24 * 60 * 60 * 1000;
+		expect(claimOverlayXLinkRecheck(db, id, { nowMs: NOW + day * 9, staleAfterMs: day }).claimed).toBe(false);
+	});
+
+	test('a renamed account keeps its link under the new handle', () => {
+		const { id } = makeOverlay(db);
+		setOverlayXLink(db, id, { handle: 'alice', proofUrl: 'https://x.com/alice/status/1', proofCode: 'ziving-abcd1234', nowMs: NOW });
+		expect(updateOverlayXLinkHandle(db, id, 'alice_zec').ok).toBe(true);
+		const row = getOverlay(db, id);
+		expect(row.x_handle).toBe('alice_zec');
+		expect(row.x_proof_url).toBe('https://x.com/alice/status/1'); // status URLs survive renames
+	});
+
+	test('renaming an unlinked page is a no-op', () => {
+		const { id } = makeOverlay(db);
+		expect(updateOverlayXLinkHandle(db, id, 'mallory').ok).toBe(false);
+		expect(getOverlay(db, id).x_handle).toBeNull();
 	});
 });

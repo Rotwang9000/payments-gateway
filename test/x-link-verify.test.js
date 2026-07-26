@@ -71,4 +71,41 @@ describe('verifyTweetHasCode', () => {
 		const out = await verifyTweetHasCode(TWEET_URL, '', { fetchImpl });
 		expect(out).toEqual({ ok: false, reason: 'no_code' });
 	});
+
+	// The handle ends up in the public campaign payload, so it may only come
+	// from an author_url that really is an X profile.
+	test('rejects an author_url that is not a plain X profile', async () => {
+		for (const authorUrl of [
+			'https://evil.example/alice',
+			'https://x.com/alice/status/1',
+			'https://x.com/alice?utm=1',
+			'https://x.com/way-too-long-a-handle-for-x',
+			'https://x.com/',
+			''
+		]) {
+			const fetchImpl = async () => oembedResponse('<blockquote>ziving-abc12345</blockquote>', authorUrl);
+			const out = await verifyTweetHasCode(TWEET_URL, 'ziving-abc12345', { fetchImpl });
+			expect(out).toEqual({ ok: false, reason: 'no_author' });
+		}
+	});
+
+	test('accepts a twitter.com author_url with a trailing slash', async () => {
+		const fetchImpl = async () => oembedResponse('<blockquote>ziving-abc12345</blockquote>', 'https://twitter.com/alice_zec/');
+		const out = await verifyTweetHasCode(TWEET_URL, 'ziving-abc12345', { fetchImpl });
+		expect(out).toEqual({ ok: true, handle: 'alice_zec' });
+	});
+
+	test('a stalled body read is bounded by the timeout, not left hanging', async () => {
+		// Headers land immediately, then the body never resolves — before the
+		// timeout covered the read, this waited for ever.
+		const fetchImpl = async (_url, { signal }) => ({
+			ok: true,
+			status: 200,
+			json: () => new Promise((_resolve, reject) => {
+				signal.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')));
+			})
+		});
+		const out = await verifyTweetHasCode(TWEET_URL, 'ziving-abc12345', { fetchImpl, timeoutMs: 30 });
+		expect(out).toEqual({ ok: false, reason: 'bad_oembed_response' });
+	});
 });

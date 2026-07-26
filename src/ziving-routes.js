@@ -65,7 +65,9 @@ import {
 	ufvkFingerprint,
 	setOverlayXLinkCode,
 	setOverlayXLink,
-	clearOverlayXLink
+	clearOverlayXLink,
+	claimOverlayXLinkRecheck,
+	updateOverlayXLinkHandle
 } from './donation-overlay-store.js';
 import { verifyTweetHasCode } from './x-link-verify.js';
 import { hashToken } from './notice-board.js';
@@ -82,6 +84,14 @@ const ZATOSHI_PER_ZEC = 100_000_000;
 const OVERLAY_RECOVER_PER_IP_PER_MIN = 10;
 /** Verify makes an outbound fetch per call — tighter than the other manage routes. */
 const X_LINK_VERIFY_PER_IP_PER_MIN = 6;
+/** How long a verified X link is trusted before the proof tweet is re-checked. */
+export const X_LINK_RECHECK_MS = 24 * 60 * 60 * 1000;
+/**
+ * Re-check outcomes that mean the proof is genuinely gone (tweet deleted,
+ * edited, account protected or suspended) rather than X being unreachable.
+ * Only these drop the badge — a flaky oEmbed call must not unlink anyone.
+ */
+const X_LINK_FATAL_REASONS = new Set(['tweet_not_found', 'code_not_found_in_tweet', 'not_a_tweet_url', 'no_author']);
 
 /**
  * Validate POST /v1/ziving/page. Extends overlay credentials with a
@@ -418,6 +428,33 @@ export function registerZivingRoutes(app, deps) {
 		});
 	});
 
+	/**
+	 * An X badge is only worth showing while the proof tweet is still there —
+	 * a deleted tweet would leave donors clicking through to two 404s, which
+	 * is worse than no badge at all. So re-check lazily on public page views,
+	 * at most daily (see claimOverlayXLinkRecheck), and never in the request
+	 * path: this returns immediately and the result lands for the next view.
+	 * A rename keeps the link and follows the new handle; only a genuinely
+	 * missing proof drops it.
+	 */
+	function recheckXLinkSoon(row, nowMs) {
+		if (!row.x_handle || !row.x_proof_url || !row.x_proof_code) return;
+		if (!claimOverlayXLinkRecheck(watchDb, row.id, { nowMs, staleAfterMs: X_LINK_RECHECK_MS }).claimed) return;
+		verifyTweetHasCode(row.x_proof_url, row.x_proof_code, { fetchImpl: xLinkFetchImpl })
+			.then((result) => {
+				if (result.ok) {
+					if (result.handle.toLowerCase() === String(row.x_handle).toLowerCase()) return;
+					updateOverlayXLinkHandle(watchDb, row.id, result.handle);
+					log.info({ overlayId: row.id, from: row.x_handle, to: result.handle }, 'ziving: x-link handle renamed');
+					return;
+				}
+				if (!X_LINK_FATAL_REASONS.has(result.reason)) return;
+				clearOverlayXLink(watchDb, row.id);
+				log.info({ overlayId: row.id, handle: row.x_handle, reason: result.reason }, 'ziving: x-link dropped, proof gone');
+			})
+			.catch((err) => log.warn({ overlayId: row.id, err: err?.message ?? String(err) }, 'ziving: x-link re-check failed'));
+	}
+
 	app.get('/v1/ziving/page/:slug', async (req, reply) => {
 		if (!watchDb) return privateNotConfigured(reply);
 		let slug;
@@ -429,6 +466,7 @@ export function registerZivingRoutes(app, deps) {
 		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
 		const nowMs = now();
 		const totals = sumConfirmedDonations(watchDb, row.id);
+		recheckXLinkSoon(row, nowMs);
 		return publicCampaign(row, totals, { nowMs, urls: urlsFor(row) });
 	});
 
@@ -636,7 +674,12 @@ export function registerZivingRoutes(app, deps) {
 		if (!result.ok) {
 			return reply.code(422).send({ error: { code: result.reason ?? 'verify_failed', message: 'could not verify that tweet contains your code — check the URL and that the tweet is public' } });
 		}
-		const out = setOverlayXLink(watchDb, row.id, { handle: result.handle, proofUrl: tweetUrl, nowMs: now() });
+		const out = setOverlayXLink(watchDb, row.id, {
+			handle: result.handle,
+			proofUrl: tweetUrl,
+			proofCode: got.x_link_code,
+			nowMs: now()
+		});
 		log.info({ slug, overlayId: row.id, handle: result.handle }, 'ziving: x-link verified');
 		return {
 			slug,
