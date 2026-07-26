@@ -533,6 +533,105 @@ describe('who benefits / what they get', () => {
 	});
 });
 
+describe('editing a page after creation', () => {
+	let db;
+	let app;
+	beforeEach(async () => { db = openDb(); app = buildApp(db); await app.ready(); });
+
+	const patch = (payload, token) => app.inject({
+		method: 'PATCH', url: '/v1/ziving/page/alice-run', payload,
+		headers: token ? { 'x-overlay-token': token } : {}
+	});
+
+	test('the owner can fix a typo without losing the URL', async () => {
+		const created = (await createPage(app, { beneficiary: 'Alice runs fro the shelter' })).json();
+		const res = await patch({ beneficiary: 'Alice runs for the shelter' }, created.ownerToken);
+		expect(res.statusCode).toBe(200);
+		expect(res.json().page.benefit.who).toBe('Alice runs for the shelter');
+		expect(res.json().page.slug).toBe('alice-run');
+		const page = await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' });
+		expect(page.json().benefit.who).toBe('Alice runs for the shelter');
+	});
+
+	test('untouched fields survive a partial edit', async () => {
+		const created = (await createPage(app, {
+			beneficiaryType: 'others', beneficiary: '30 pupils', outcome: 'Ten laptops', story: 'The long version.'
+		})).json();
+		await patch({ outcome: 'Twelve laptops' }, created.ownerToken);
+		const page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.benefit).toMatchObject({ type: 'others', who: '30 pupils', what: 'Twelve laptops' });
+		expect(page.story).toBe('The long version.');
+		expect(page.label).toBe('Alice runs for cats');
+	});
+
+	test('sending a field as empty clears it', async () => {
+		const created = (await createPage(app, { story: 'Delete me.' })).json();
+		await patch({ story: '' }, created.ownerToken);
+		const page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.story).toBeNull();
+	});
+
+	test('the goal can be changed and cleared', async () => {
+		const created = (await createPage(app, { goalZec: 10 })).json();
+		await patch({ goalZec: 25 }, created.ownerToken);
+		let page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.goalZec).toBe(25);
+		await patch({ goalZec: null }, created.ownerToken);
+		page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.goalZec).toBeNull();
+	});
+
+	test('edits are stamped publicly, and unedited pages are not', async () => {
+		const created = (await createPage(app)).json();
+		expect(created.page.contentUpdatedAt).toBeNull();
+		await patch({ label: 'Alice runs further' }, created.ownerToken);
+		const page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.contentUpdatedAt).toBe(new Date(NOW).toISOString());
+	});
+
+	test('strangers cannot rewrite someone else\'s page', async () => {
+		await createPage(app);
+		expect((await patch({ label: 'Send money here instead' }, 'wrong')).statusCode).toBe(403);
+		expect((await patch({ label: 'Send money here instead' })).statusCode).toBe(403);
+		const page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.label).toBe('Alice runs for cats');
+	});
+
+	test('the slug and wallet are not editable, even if asked', async () => {
+		const created = (await createPage(app)).json();
+		const res = await patch({ slug: 'somewhere-else', address: 'u1attacker', ufvk: 'uviewattacker' }, created.ownerToken);
+		expect(res.statusCode).toBe(400);
+		expect(res.json().error.code).toBe('no_changes');
+		const row = getOverlayBySlug(db, 'alice-run');
+		expect(row.address).toBe(ADDR);
+	});
+
+	test('a bad value is rejected and changes nothing', async () => {
+		const created = (await createPage(app, { beneficiaryType: 'others' })).json();
+		const res = await patch({ beneficiaryType: 'shareholders', outcome: 'Twelve laptops' }, created.ownerToken);
+		expect(res.statusCode).toBe(400);
+		const page = (await app.inject({ method: 'GET', url: '/v1/ziving/page/alice-run' })).json();
+		expect(page.benefit.type).toBe('others');
+		expect(page.benefit.what).toBeNull();
+		expect(page.contentUpdatedAt).toBeNull();
+	});
+
+	test('a cancelled page cannot be edited', async () => {
+		const created = (await createPage(app)).json();
+		expect(cancelOverlay(db, created.overlayId, created.ownerToken).ok).toBe(true);
+		const res = await patch({ label: 'Back from the dead' }, created.ownerToken);
+		expect(res.statusCode).toBe(409);
+	});
+
+	test('a session token from wallet login works too', async () => {
+		await createPage(app);
+		const login = await app.inject({ method: 'POST', url: '/v1/ziving/wallet/login', payload: { ufvk: UFVK } });
+		const res = await patch({ label: 'Edited via wallet' }, login.json().sessionToken);
+		expect(res.statusCode).toBe(200);
+		expect(res.json().page.label).toBe('Edited via wallet');
+	});
+});
+
 describe('ziving X (Twitter) link', () => {
 	let db;
 	let app;

@@ -211,6 +211,10 @@ function migrateDonationOverlaySchema(db) {
 	if (!cols.has('beneficiary_type')) db.exec('ALTER TABLE donation_overlays ADD COLUMN beneficiary_type TEXT');
 	if (!cols.has('beneficiary')) db.exec('ALTER TABLE donation_overlays ADD COLUMN beneficiary TEXT');
 	if (!cols.has('outcome')) db.exec('ALTER TABLE donation_overlays ADD COLUMN outcome TEXT');
+	// When the public text was last edited. Shown to donors: a page can be
+	// rewritten after money arrives, and hiding that would be the dishonest
+	// option. Null means "never edited since creation".
+	if (!cols.has('content_updated_at_ms')) db.exec('ALTER TABLE donation_overlays ADD COLUMN content_updated_at_ms INTEGER');
 	db.exec('CREATE INDEX IF NOT EXISTS idx_overlay_ufvk_fp ON donation_overlays(ufvk_fingerprint) WHERE ufvk_fingerprint IS NOT NULL');
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS overlay_sessions (
@@ -435,6 +439,42 @@ export function createOverlay(db, {
 		credit: creditAtomic
 	});
 	return { id, ownerToken, expiresAt, createdAt: nowMs };
+}
+
+/**
+ * The public text an owner may edit after creation, mapped to its column.
+ * Deliberately excludes slug (links must keep working), the wallet, and
+ * anything money-related besides the goal.
+ */
+const CONTENT_COLUMNS = Object.freeze({
+	label: 'label',
+	story: 'story',
+	beneficiaryType: 'beneficiary_type',
+	beneficiary: 'beneficiary',
+	outcome: 'outcome',
+	goalZatoshi: 'goal_zatoshi'
+});
+
+/**
+ * Patch a campaign's public text. Only keys actually present in `fields`
+ * are touched, so a caller can clear one field (null) without having to
+ * resend the rest and risk clobbering an edit made elsewhere.
+ */
+export function updateOverlayContent(db, id, fields = {}, { nowMs = Date.now() } = {}) {
+	const row = getOverlay(db, id);
+	if (!row) return { ok: false, reason: 'not_found' };
+	const sets = [];
+	const vals = [];
+	for (const [key, col] of Object.entries(CONTENT_COLUMNS)) {
+		if (!Object.hasOwn(fields, key)) continue;
+		sets.push(`${col} = ?`);
+		vals.push(fields[key] ?? null);
+	}
+	if (sets.length === 0) return { ok: false, reason: 'no_changes' };
+	sets.push('content_updated_at_ms = ?');
+	vals.push(nowMs);
+	db.prepare(`UPDATE donation_overlays SET ${sets.join(', ')} WHERE id = ?`).run(...vals, id);
+	return { ok: true, fields: Object.keys(fields), updatedAtMs: nowMs };
 }
 
 /** Fetch an overlay row by public id (no auth). Returns row or null. */

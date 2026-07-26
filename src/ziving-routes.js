@@ -11,6 +11,7 @@
 //   GET  /v1/ziving/activity                latest confirmed gifts + newest pages (homepage feed)
 //   POST /v1/ziving/page                    create campaign (rate-limited)
 //   GET  /v1/ziving/page/:slug              public page data + totals
+//   PATCH /v1/ziving/page/:slug             owner/session token → edit the public text
 //   GET  /v1/ziving/page/:slug/events       donation feed (cursor-paginated)
 //   POST /v1/ziving/page/:slug/feature      owner token → ZEC quote for homepage promo
 //   POST /v1/ziving/wallet/login            wallet UFVK → page list + manage session token
@@ -63,6 +64,7 @@ import {
 	findOverlaysByUfvk,
 	createOverlaySession,
 	ufvkFingerprint,
+	updateOverlayContent,
 	setOverlayXLinkCode,
 	setOverlayXLink,
 	clearOverlayXLink,
@@ -114,6 +116,41 @@ function optionalShortText(value, maxLen, field) {
 	return clean.length === 0 ? null : clean;
 }
 
+function parseBeneficiaryType(value) {
+	if (value === undefined || value === null || value === '') return null;
+	const type = String(value).trim().toLowerCase();
+	if (!Object.hasOwn(BENEFICIARY_TYPES, type)) {
+		throw new TypeError(`beneficiaryType must be one of: ${Object.keys(BENEFICIARY_TYPES).join(', ')}`);
+	}
+	return type;
+}
+
+function parseGoalZatoshi(value) {
+	if (value === undefined || value === null || value === '') return null;
+	const z = Number(value);
+	if (!Number.isFinite(z) || z <= 0 || z > 1_000_000) {
+		throw new TypeError('goalZec must be a positive number up to 1,000,000');
+	}
+	return String(Math.round(z * ZATOSHI_PER_ZEC));
+}
+
+/**
+ * Validate an edit to a campaign's public text. Only keys the caller
+ * actually sent are returned, so PATCH can change one field and leave the
+ * rest alone; sending a key as null or "" clears it.
+ */
+export function validateCampaignPatch(body = {}) {
+	const out = {};
+	const sent = (key) => body != null && Object.hasOwn(body, key);
+	if (sent('label')) out.label = optionalShortText(body.label, OVERLAY_CONSTANTS.LABEL_MAX_LEN, 'label');
+	if (sent('story')) out.story = optionalShortText(body.story, OVERLAY_CONSTANTS.STORY_MAX_LEN, 'story');
+	if (sent('beneficiaryType')) out.beneficiaryType = parseBeneficiaryType(body.beneficiaryType);
+	if (sent('beneficiary')) out.beneficiary = optionalShortText(body.beneficiary, OVERLAY_CONSTANTS.BENEFICIARY_MAX_LEN, 'beneficiary');
+	if (sent('outcome')) out.outcome = optionalShortText(body.outcome, OVERLAY_CONSTANTS.OUTCOME_MAX_LEN, 'outcome');
+	if (sent('goalZec')) out.goalZatoshi = parseGoalZatoshi(body.goalZec);
+	return out;
+}
+
 /**
  * Validate POST /v1/ziving/page. Extends overlay credentials with a
  * required slug, the optional "who benefits / what they get" pair, and an
@@ -140,23 +177,10 @@ export function validateZivingPageRequest(body, policy) {
 		story = sanitiseText(body.story, OVERLAY_CONSTANTS.STORY_MAX_LEN);
 		if (story.length === 0) story = null;
 	}
-	let beneficiaryType = null;
-	if (body.beneficiaryType !== undefined && body.beneficiaryType !== null && body.beneficiaryType !== '') {
-		beneficiaryType = String(body.beneficiaryType).trim().toLowerCase();
-		if (!Object.hasOwn(BENEFICIARY_TYPES, beneficiaryType)) {
-			throw new TypeError(`beneficiaryType must be one of: ${Object.keys(BENEFICIARY_TYPES).join(', ')}`);
-		}
-	}
+	const beneficiaryType = parseBeneficiaryType(body.beneficiaryType);
 	const beneficiary = optionalShortText(body.beneficiary, OVERLAY_CONSTANTS.BENEFICIARY_MAX_LEN, 'beneficiary');
 	const outcome = optionalShortText(body.outcome, OVERLAY_CONSTANTS.OUTCOME_MAX_LEN, 'outcome');
-	let goalZatoshi = null;
-	if (body.goalZec !== undefined && body.goalZec !== null && body.goalZec !== '') {
-		const z = Number(body.goalZec);
-		if (!Number.isFinite(z) || z <= 0 || z > 1_000_000) {
-			throw new TypeError('goalZec must be a positive number up to 1,000,000');
-		}
-		goalZatoshi = String(Math.round(z * ZATOSHI_PER_ZEC));
-	}
+	const goalZatoshi = parseGoalZatoshi(body.goalZec);
 	return Object.freeze({ ...base, slug, story, beneficiaryType, beneficiary, outcome, goalZatoshi });
 }
 
@@ -200,6 +224,11 @@ export function publicCampaign(row, totals, { nowMs = Date.now(), urls = {} } = 
 			proofUrl: row.x_proof_url ?? null,
 			verifiedAt: row.x_verified_at_ms != null ? new Date(Number(row.x_verified_at_ms)).toISOString() : null
 		} : null,
+		// A page can be rewritten after money has arrived; donors get to see
+		// that it was, rather than us quietly swapping the text.
+		contentUpdatedAt: row.content_updated_at_ms != null
+			? new Date(Number(row.content_updated_at_ms)).toISOString()
+			: null,
 		state: overlay.state,
 		active: overlay.active,
 		credit: overlay.credit,
@@ -279,7 +308,7 @@ export function registerZivingRoutes(app, deps) {
 			how_it_works: [
 				'1. Create a donation-only shielded wallet in Winbit32 (vault or receive wizard) and export the UFVK + unified address.',
 				'2. POST /v1/ziving/page { slug, label, beneficiaryType?, beneficiary?, outcome?, story?, goalZec?, ufvk, address, amountUsdCents? } — returns your public page URL, ownerToken + recoveryCode (each shown once) and a ZEC funding quote.',
-				'3. Share the page; donations appear live on the page and in the OBS overlay feed.',
+				'3. Share the page; donations appear live on the page and in the OBS overlay feed. Fix wording later with PATCH /v1/ziving/page/:slug { label?, beneficiaryType?, beneficiary?, outcome?, story?, goalZec? } (header x-overlay-token) — the slug never changes, and edits are stamped publicly.',
 				'4. Top up scanning with POST /v1/overlay/:id/topup; promote on the homepage with POST /v1/ziving/page/:slug/feature (header x-overlay-token). Wallet holders can POST /v1/ziving/wallet/login { ufvk } for a page list + manage session.',
 				'5. Lost the ownerToken? POST /v1/ziving/page/:slug/recover { recoveryCode } → pay the small ZEC quote → POST .../recover/claim { recoveryCode } for a fresh ownerToken.'
 			],
@@ -675,6 +704,42 @@ export function registerZivingRoutes(app, deps) {
 			recoveryCode: out.recoveryCode,
 			note: 'New recovery code — the previous one (if any) is retired. Shown exactly once; store it offline.'
 		};
+	});
+
+	// ── Edit the public text. Campaign pages are mostly words, and until
+	// this existed a typo in the thing donors read first was permanent —
+	// the only fix was to cancel and start again, losing the URL. The slug
+	// stays fixed so shared links keep working.
+	const editOpts = { config: { rateLimit: { max: OVERLAY_RECOVER_PER_IP_PER_MIN, timeWindow: '1 minute' } } };
+	app.patch('/v1/ziving/page/:slug', editOpts, async (req, reply) => {
+		if (!watchDb) return privateNotConfigured(reply);
+		let slug;
+		try { slug = normaliseCampaignSlug(req.params.slug); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const row = getOverlayBySlug(watchDb, slug);
+		if (!row) return reply.code(404).send({ error: { code: 'not_found', message: 'campaign page not found' } });
+		const token = req.headers['x-overlay-token'] ?? req.body?.ownerToken;
+		const got = getOverlayAuthorised(watchDb, row.id, typeof token === 'string' ? token : '', { nowMs: now() });
+		if (got.error === 'forbidden') return reply.code(403).send({ error: { code: 'forbidden', message: 'owner token mismatch (pass it via the x-overlay-token header)' } });
+		if (got.cancelled === 1) return reply.code(409).send({ error: { code: 'cancelled', message: 'page is cancelled' } });
+
+		let fields;
+		try { fields = validateCampaignPatch(req.body ?? {}); }
+		catch (err) {
+			return reply.code(400).send({ error: { code: 'invalid_request', message: err?.message ?? String(err) } });
+		}
+		const out = updateOverlayContent(watchDb, row.id, fields, { nowMs: now() });
+		if (!out.ok && out.reason === 'no_changes') {
+			return reply.code(400).send({
+				error: { code: 'no_changes', message: `send at least one of: label, story, beneficiaryType, beneficiary, outcome, goalZec` }
+			});
+		}
+		const fresh = getOverlay(watchDb, row.id);
+		const totals = sumConfirmedDonations(watchDb, row.id);
+		log.info({ slug, overlayId: row.id, fields: out.fields }, 'ziving: page text edited');
+		return { slug, updated: out.fields, page: publicCampaign(fresh, totals, { nowMs: now(), urls: urlsFor(fresh) }) };
 	});
 
 	// ── X (Twitter) self-attestation, step 1: issue a public nonce to post.
