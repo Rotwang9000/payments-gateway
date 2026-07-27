@@ -550,6 +550,13 @@ export function applyFeaturePurchase(db, overlayId, { quoteId = null, days, usdC
 			LIMIT 1
 		`).get(overlayId, usdCents);
 	if (!pending) return { ok: false, reason: 'no_pending_feature' };
+	// Short payments don't buy a fixed-price product. The poller already
+	// forgives small rate drift (it credits the full quote within its
+	// tolerance), so what arrives here really is less than the price — the
+	// caller turns it into scanning credit instead and leaves the quote open.
+	if (usdCents < Number(pending.usd_cents)) {
+		return { ok: false, reason: 'underpaid', quotedUsdCents: Number(pending.usd_cents), paidUsdCents: usdCents };
+	}
 	const row = getOverlay(db, overlayId);
 	if (!row) return { ok: false, reason: 'not_found' };
 	if (row.cancelled === 1) return { ok: false, reason: 'cancelled' };
@@ -785,6 +792,10 @@ export function applyRecoveryUnlock(db, overlayId, {
 			LIMIT 1
 		`).get(overlayId, usdCents);
 	if (!pending) return { ok: false, reason: 'no_pending_recovery' };
+	// Same rule as applyFeaturePurchase: an unlock is a price, not a donation.
+	if (usdCents < Number(pending.usd_cents)) {
+		return { ok: false, reason: 'underpaid', quotedUsdCents: Number(pending.usd_cents), paidUsdCents: usdCents };
+	}
 	const row = getOverlay(db, overlayId);
 	if (!row) return { ok: false, reason: 'not_found' };
 	if (row.cancelled === 1) return { ok: false, reason: 'cancelled' };

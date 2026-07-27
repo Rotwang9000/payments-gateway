@@ -126,7 +126,11 @@ export function makeOverlayCreditApplier(db) {
 				excessCreditedUsdCents: refundExcess(watchId, usdCents, rec.quotedUsdCents)
 			};
 		}
-		if (rec.reason && rec.reason !== 'no_pending_recovery') return { ok: false, reason: rec.reason };
+		// 'underpaid' is not a failure: the money is real, it just didn't
+		// buy the product, so it falls through to scanning credit below.
+		if (rec.reason && rec.reason !== 'no_pending_recovery' && rec.reason !== 'underpaid') {
+			return { ok: false, reason: rec.reason };
+		}
 		// Homepage feature quotes settle next (same overlay id, distinct cents).
 		const feat = applyFeaturePurchase(db, watchId, { quoteId, usdCents });
 		if (feat.ok) {
@@ -135,13 +139,16 @@ export function makeOverlayCreditApplier(db) {
 				excessCreditedUsdCents: refundExcess(watchId, usdCents, feat.quotedUsdCents)
 			};
 		}
-		if (feat.reason && feat.reason !== 'no_pending_feature') {
+		if (feat.reason && feat.reason !== 'no_pending_feature' && feat.reason !== 'underpaid') {
 			return { ok: false, reason: feat.reason };
 		}
 		const out = topupOverlayById(db, watchId, { creditAtomic: usdCents * CENTS_TO_ATOMIC_USDC });
-		return out.ok
-			? { ok: true, kind: 'scan', newBalanceAtomic: out.row.credit_atomic }
-			: { ok: false, reason: out.reason };
+		if (!out.ok) return { ok: false, reason: out.reason };
+		const shortOf = rec.reason === 'underpaid' ? rec : feat.reason === 'underpaid' ? feat : null;
+		return {
+			ok: true, kind: 'scan', newBalanceAtomic: out.row.credit_atomic,
+			...(shortOf ? { underpaidQuotedUsdCents: shortOf.quotedUsdCents } : {})
+		};
 	};
 }
 

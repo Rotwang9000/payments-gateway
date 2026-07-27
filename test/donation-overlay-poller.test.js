@@ -261,6 +261,32 @@ describe('makeOverlayCreditApplier', () => {
 		expect(getOverlay(db, id).credit_atomic).toBe(before);
 	});
 
+	test('under-paying a feature quote buys scanning credit, not the feature', () => {
+		const db = openDb();
+		const { id } = makeOverlay(db);
+		createFeatureQuote(db, { quoteId: 'q-feat', overlayId: id, days: 1, usdCents: 500, nowMs: NOW });
+		const before = getOverlay(db, id).credit_atomic;
+		// $2 against a $5 feature: real money, but not the price.
+		const out = makeOverlayCreditApplier(db)({ watchId: id, usdCents: 200, quoteId: 'q-feat' });
+		expect(out).toMatchObject({ ok: true, kind: 'scan', underpaidQuotedUsdCents: 500 });
+		expect(getOverlay(db, id).credit_atomic).toBe(before + 200 * 10_000);
+		expect(getOverlay(db, id).featured_until_ms).toBeFalsy();
+		// The quote stays open, so paying the rest later still buys the feature.
+		const paid = makeOverlayCreditApplier(db)({ watchId: id, usdCents: 500, quoteId: 'q-feat' });
+		expect(paid).toMatchObject({ ok: true, kind: 'feature', days: 1 });
+	});
+
+	test('under-paying a lost-key unlock does not unlock it', () => {
+		const db = openDb();
+		const { id } = makeOverlay(db);
+		createRecoveryQuoteRow(db, { quoteId: 'q-rec', overlayId: id, usdCents: 200, nowMs: NOW });
+		const before = getOverlay(db, id).credit_atomic;
+		const out = makeOverlayCreditApplier(db)({ watchId: id, usdCents: 100, quoteId: 'q-rec' });
+		expect(out).toMatchObject({ ok: true, kind: 'scan', underpaidQuotedUsdCents: 200 });
+		expect(getOverlay(db, id).credit_atomic).toBe(before + 100 * 10_000);
+		expect(getOverlay(db, id).recovery_unlock_ms).toBeFalsy();
+	});
+
 	test('over-paying a lost-key unlock also lands as scanning credit', () => {
 		const db = openDb();
 		const { id } = makeOverlay(db);
