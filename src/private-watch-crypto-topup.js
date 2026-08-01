@@ -18,7 +18,7 @@
 // Pure helpers are exported so the validators + formatting are unit
 // tested without Fastify.
 
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, randomInt } from 'node:crypto';
 
 import {
 	createQuote,
@@ -71,10 +71,19 @@ export function validateCryptoTopupRequest(body, { minUsdCents, maxUsdCents }) {
 	return Object.freeze({ watchId: body.watchId, watchToken: body.watchToken, chain: body.chain, amountUsdCents: cents });
 }
 
-/** Add a unique low-digit invoice tag to a Monero amount (BigInt piconero). */
+/**
+ * Add a unique low-digit invoice tag to a Monero amount (BigInt piconero).
+ *
+ * `randomInt` rather than `Math.random`: the tag is how we tell one
+ * payer's transfer from another's, so a third party who can predict the
+ * next tag can pay an amount that collides with someone's open quote.
+ * Collision checking upstream makes that a nuisance rather than a theft,
+ * but the CSPRNG is already imported two lines up and is unbiased over
+ * the range, which `floor(random() * n)` is not.
+ */
 export function withMoneroTag(atomic) {
 	const aligned = atomic + ((MONERO_TAG_SLOT - (atomic % MONERO_TAG_SLOT)) % MONERO_TAG_SLOT);
-	const tag = BigInt(1 + Math.floor(Math.random() * (Number(MONERO_TAG_SLOT) - 1)));
+	const tag = BigInt(randomInt(1, Number(MONERO_TAG_SLOT)));
 	return aligned + tag;
 }
 
