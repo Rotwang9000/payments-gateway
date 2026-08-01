@@ -70,6 +70,7 @@ import {
 	splitSecretHex,
 	combineSecretShares
 } from './utility-tools.js';
+import { checkRngHealth, describeEntropySources } from './secure-entropy.js';
 import {
 	buildAmountAdvice,
 	planAmountSplit,
@@ -1132,11 +1133,27 @@ export function registerUtilityMcpTools(server, opts = {}) {
 
 	server.registerTool(`${prefix}_phrase_generate`, {
 		title: 'Generate a BIP-39 seed phrase (local, FREE)',
-		description: 'Generate a fresh mnemonic with server-side CSPRNG entropy. SECURITY: whoever sees this response controls the wallet — treat the transcript as sensitive, prefer self-hosted servers, and prefer the split-wult cosign model over raw phrases where possible.',
+		description: 'Generate a fresh mnemonic. Entropy is HKDF-SHA512 over two independent CSPRNG draws plus anything passed as extraEntropy, and the generator is self-tested for catastrophic failure first — generation is REFUSED rather than degraded if that test fails. The response includes the live self-test result so you can check rather than assume. SECURITY: whoever sees this response controls the wallet — treat the transcript as sensitive, prefer self-hosted servers, and prefer the split-vult cosign model over raw phrases where possible.',
 		inputSchema: {
-			wordCount: z.number().int().optional().describe('12, 15, 18, 21 or 24 (default 12).')
+			wordCount: z.number().int().optional().describe('12, 15, 18, 21 or 24 (default 12).'),
+			extraEntropy: z.string().optional().describe('Your own randomness — dice rolls, a keyboard mash — mixed in ALONGSIDE the server CSPRNG, never instead of it, so it can only strengthen the result. ~50 fair d6 rolls carry 128 bits on their own; ~99 carry 256. Use this if you do not want to trust this server\'s generator.')
 		}
-	}, wrap(({ wordCount }) => generatePhrase(wordCount ?? 12)));
+	}, wrap(({ wordCount, extraEntropy }) => generatePhrase(wordCount ?? 12, extraEntropy)));
+
+	server.registerTool(`${prefix}_entropy_selftest`, {
+		title: 'Self-test the key-generation randomness (local, FREE)',
+		description: 'Run the random number generator health check that guards seed generation on this server, and report how generated entropy is constructed. Checks for the failures that actually occur in the field — a stuck source returning identical draws, constant output, or output covering implausibly few distinct byte values. Prompted by the Coldcard Mk3 advisory, where a single RNG degraded silently for nine firmware releases. Takes no arguments and reveals no secrets; call it before trusting phrase_generate.',
+		inputSchema: {}
+	}, wrap(() => {
+		const health = checkRngHealth(true); // force a fresh probe, not the cached boot result
+		return {
+			...describeEntropySources(),
+			health,
+			verdict: health.ok
+				? 'PASSED — no sign of catastrophic RNG failure. Note this cannot detect a well-formed but predictable generator; pass extraEntropy to phrase_generate if you need to not trust this server at all.'
+				: 'FAILED — do not use any key material this server has produced.'
+		};
+	}));
 
 	server.registerTool(`${prefix}_shamir_split`, {
 		title: 'Shamir-split a hex secret (local, FREE)',
@@ -1157,7 +1174,7 @@ export function registerUtilityMcpTools(server, opts = {}) {
 	}, wrap(({ shares }) => combineSecretShares(shares)));
 
 	return {
-		names: ['phrase_validate', 'phrase_complete', 'phrase_generate', 'shamir_split', 'shamir_combine']
+		names: ['phrase_validate', 'phrase_complete', 'phrase_generate', 'entropy_selftest', 'shamir_split', 'shamir_combine']
 			.map((n) => `${prefix}_${n}`)
 	};
 }

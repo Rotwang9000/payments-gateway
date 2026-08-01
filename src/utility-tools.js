@@ -7,8 +7,9 @@
 // who care should run this server themselves rather than trust a hosted one.
 
 import { split as shamirSplit, combine as shamirCombine } from 'shamirs-secret-sharing';
-import { generateMnemonic, validateMnemonic } from '@scure/bip39';
+import { entropyToMnemonic, validateMnemonic } from '@scure/bip39';
 import { wordlist as englishWordlist } from '@scure/bip39/wordlists/english.js';
+import { generateEntropyBytes, describeEntropySources } from './secure-entropy.js';
 
 const VALID_PHRASE_LENGTHS = [12, 15, 18, 21, 24];
 const PHRASE_STRENGTH_BY_LENGTH = { 12: 128, 15: 160, 18: 192, 21: 224, 24: 256 };
@@ -78,13 +79,39 @@ export function findChecksumWords(partialPhrase) {
 	return { candidates, position: words.length + 1 };
 }
 
-/** Generate a fresh BIP-39 mnemonic of the requested length (default 12). */
-export function generatePhrase(wordCount = 12) {
+/**
+ * Generate a fresh BIP-39 mnemonic of the requested length (default 12).
+ *
+ * Entropy comes from `secure-entropy.js` rather than straight from the
+ * CSPRNG: the generator is self-tested for catastrophic failure before
+ * use, and the result is HKDF over two independent draws plus anything
+ * the caller supplied. Callers who do not want to trust this server's
+ * RNG at all can pass their own dice rolls as `extraEntropy` — it is
+ * mixed in alongside, never instead of, the CSPRNG, so it can only add.
+ *
+ * The returned `entropySources` is the live self-test result, so an
+ * agent can check the generator rather than assume it.
+ */
+export function generatePhrase(wordCount = 12, extraEntropy) {
 	const strength = PHRASE_STRENGTH_BY_LENGTH[wordCount];
 	if (!strength) {
 		throw new Error(`wordCount must be one of ${VALID_PHRASE_LENGTHS.join(', ')}`);
 	}
-	return { phrase: generateMnemonic(englishWordlist, strength), wordCount };
+	const entropy = generateEntropyBytes(strength / 8, extraEntropy);
+	const phrase = entropyToMnemonic(entropy, englishWordlist);
+	entropy.fill(0);
+	// Cheap insurance against a broken wordlist or encoder handing back
+	// a phrase that will not restore.
+	if (!validateMnemonic(phrase, englishWordlist)) {
+		throw new Error('Generated mnemonic failed its own checksum validation — refusing to return it.');
+	}
+	return {
+		phrase,
+		wordCount,
+		entropyBits: strength,
+		extraEntropyUsed: Boolean(extraEntropy),
+		entropySources: describeEntropySources()
+	};
 }
 
 /**

@@ -97,11 +97,17 @@ describe('registerUtilityMcpTools', () => {
 		const { names } = registerUtilityMcpTools(server, { toolPrefix: 'wb32' });
 		expect(names).toEqual([
 			'wb32_phrase_validate', 'wb32_phrase_complete', 'wb32_phrase_generate',
-			'wb32_shamir_split', 'wb32_shamir_combine'
+			'wb32_entropy_selftest', 'wb32_shamir_split', 'wb32_shamir_combine'
 		]);
 
 		const validated = parseContent(await server.tools.get('wb32_phrase_validate').handler({ phrase: ABANDON_12 }));
 		expect(validated.valid).toBe(true);
+
+		// The self-test is the guard in front of phrase_generate, so an
+		// agent must be able to check it before trusting a generated key.
+		const selftest = parseContent(await server.tools.get('wb32_entropy_selftest').handler({}));
+		expect(selftest.health.ok).toBe(true);
+		expect(selftest.verdict).toMatch(/^PASSED/);
 
 		const split = parseContent(await server.tools.get('wb32_shamir_split').handler({ secretHex: 'aabbcc', shares: 3, threshold: 2 }));
 		const combined = parseContent(await server.tools.get('wb32_shamir_combine').handler({ shares: split.shares.slice(0, 2) }));
